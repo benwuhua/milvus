@@ -826,7 +826,7 @@ func (v *ParserVisitor) getColumnInfoFromStructSubField(tokenText string) (*plan
 	}
 
 	// Construct full field name for struct array field
-	fullFieldName := v.currentStructArrayField + "[" + fieldName + "]"
+	fullFieldName := typeutil.ConcatStructFieldName(v.currentStructArrayField, fieldName)
 	// Get the struct array field info
 	field, err := v.schema.GetFieldFromName(fullFieldName)
 	if err != nil {
@@ -1396,6 +1396,34 @@ func (v *ParserVisitor) VisitJSONIdentifier(ctx *parser.JSONIdentifierContext) i
 			},
 		},
 		dataType:      field.GetDataType(),
+		nodeDependent: true,
+	}
+}
+
+// VisitStructField handles struct_array[sub_field] syntax for struct sub-field access.
+func (v *ParserVisitor) VisitStructField(ctx *parser.StructFieldContext) interface{} {
+	// Get the full identifier text, e.g., "struct_array[sub_int]"
+	identifier := ctx.StructFieldIdentifier().GetText()
+
+	// Look up the field directly by its full name
+	field, err := v.schema.GetFieldFromName(identifier)
+	if err != nil {
+		return fmt.Errorf("struct field not found: %s, error: %s", identifier, err)
+	}
+
+	return &ExprWithType{
+		expr: &planpb.Expr{
+			Expr: &planpb.Expr_ColumnExpr{
+				ColumnExpr: &planpb.ColumnExpr{
+					Info: &planpb.ColumnInfo{
+						FieldId:     field.FieldID,
+						DataType:    field.DataType,
+						ElementType: field.GetElementType(),
+					},
+				},
+			},
+		},
+		dataType:      field.DataType,
 		nodeDependent: true,
 	}
 }
@@ -2202,7 +2230,7 @@ func (v *ParserVisitor) VisitStructSubField(ctx *parser.StructSubFieldContext) i
 	}
 
 	// Construct full field name for struct array field
-	fullFieldName := v.currentStructArrayField + "[" + fieldName + "]"
+	fullFieldName := typeutil.ConcatStructFieldName(v.currentStructArrayField, fieldName)
 	// Get the struct array field info
 	field, err := v.schema.GetFieldFromName(fullFieldName)
 	if err != nil {

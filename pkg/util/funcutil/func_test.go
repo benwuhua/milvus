@@ -252,12 +252,13 @@ func TestGetCollectionIDFromVChannel(t *testing.T) {
 func TestCheckCtxValid(t *testing.T) {
 	bgCtx := context.Background()
 	timeout := 20 * time.Millisecond
-	deltaTime := 5 * time.Millisecond
+
 	ctx1, cancel1 := context.WithTimeout(bgCtx, timeout)
 	defer cancel1()
 	assert.True(t, CheckCtxValid(ctx1))
-	time.Sleep(timeout + deltaTime)
-	assert.False(t, CheckCtxValid(ctx1))
+	assert.Eventually(t, func() bool {
+		return !CheckCtxValid(ctx1)
+	}, time.Second, time.Millisecond)
 
 	ctx2, cancel2 := context.WithTimeout(bgCtx, timeout)
 	assert.True(t, CheckCtxValid(ctx2))
@@ -268,8 +269,9 @@ func TestCheckCtxValid(t *testing.T) {
 	ctx3, cancel3 := context.WithDeadline(bgCtx, futureTime)
 	defer cancel3()
 	assert.True(t, CheckCtxValid(ctx3))
-	time.Sleep(timeout + deltaTime)
-	assert.False(t, CheckCtxValid(ctx3))
+	assert.Eventually(t, func() bool {
+		return !CheckCtxValid(ctx3)
+	}, time.Second, time.Millisecond)
 }
 
 func TestCheckPortAvailable(t *testing.T) {
@@ -598,14 +600,12 @@ func TestIsEmptyString(t *testing.T) {
 	assert.Equal(t, IsEmptyString("hello"), false)
 }
 
-func TestHandleTenantForEtcdKey(t *testing.T) {
-	assert.Equal(t, "a/b/c", HandleTenantForEtcdKey("a", "b", "c"))
-
-	assert.Equal(t, "a/b", HandleTenantForEtcdKey("a", "", "b"))
-
-	assert.Equal(t, "a/b", HandleTenantForEtcdKey("a", "b", ""))
-
-	assert.Equal(t, "a", HandleTenantForEtcdKey("a", "", ""))
+func TestHandleTenantForEtcdPrefix(t *testing.T) {
+	assert.Equal(t, "a/b/c/", HandleTenantForEtcdPrefix("a", "b", "c"))
+	assert.Equal(t, "a/b/", HandleTenantForEtcdPrefix("a", "", "b"))
+	assert.Equal(t, "a/sub/", HandleTenantForEtcdPrefix("a", "", "sub"))
+	assert.Equal(t, "a/b/", HandleTenantForEtcdPrefix("a", "b"))
+	assert.Equal(t, "a/", HandleTenantForEtcdPrefix("a", ""))
 }
 
 func TestIsRevoke(t *testing.T) {
@@ -1020,6 +1020,29 @@ func TestChannelConvert(t *testing.T) {
 	t.Run("get virtual channel", func(t *testing.T) {
 		channel := GetVirtualChannel("by-dev-rootcoord-dml_2", 1001, 0)
 		assert.Equal(t, "by-dev-rootcoord-dml_2_1001v0", channel)
+	})
+
+	t.Run("is on physical channel with prefix ambiguity", func(t *testing.T) {
+		// Two pchannels where one is a prefix of the other:
+		// by-dev-rootcoord-dml_1 vs by-dev-rootcoord-dml_10
+		pchannel1 := "by-dev-rootcoord-dml_1"
+		pchannel10 := "by-dev-rootcoord-dml_10"
+
+		// vchannel on pchannel_1
+		vchannel1 := "by-dev-rootcoord-dml_1_1001v0"
+		assert.True(t, IsOnPhysicalChannel(vchannel1, pchannel1))
+		assert.False(t, IsOnPhysicalChannel(vchannel1, pchannel10))
+
+		// vchannel on pchannel_10
+		vchannel10 := "by-dev-rootcoord-dml_10_1001v0"
+		assert.False(t, IsOnPhysicalChannel(vchannel10, pchannel1))
+		assert.True(t, IsOnPhysicalChannel(vchannel10, pchannel10))
+
+		// pchannel matches itself
+		assert.True(t, IsOnPhysicalChannel(pchannel1, pchannel1))
+		assert.True(t, IsOnPhysicalChannel(pchannel10, pchannel10))
+		assert.False(t, IsOnPhysicalChannel(pchannel1, pchannel10))
+		assert.False(t, IsOnPhysicalChannel(pchannel10, pchannel1))
 	})
 }
 

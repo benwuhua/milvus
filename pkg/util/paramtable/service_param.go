@@ -723,6 +723,18 @@ type WoodpeckerConfig struct {
 	SegmentRollingMaxBlocks ParamItem `refreshable:"true"`
 	AuditorMaxInterval      ParamItem `refreshable:"true"`
 
+	// quorum configuration
+	// Buffer pools for different regions
+	QuorumBufferPools ParamItem `refreshable:"true"`
+
+	// Quorum selection strategy
+	QuorumAffinityMode ParamItem `refreshable:"true"`
+	QuorumReplicas     ParamItem `refreshable:"true"`
+	QuorumStrategy     ParamItem `refreshable:"true"`
+
+	// Custom placement for replicas
+	QuorumCustomPlacement ParamItem `refreshable:"true"`
+
 	// logstore
 	SyncMaxInterval                ParamItem `refreshable:"true"`
 	SyncMaxIntervalForLocalStorage ParamItem `refreshable:"true"`
@@ -817,6 +829,80 @@ func (p *WoodpeckerConfig) Init(base *BaseTable) {
 		Export:       true,
 	}
 	p.AuditorMaxInterval.Init(base.mgr)
+
+	// Buffer pools for different regions
+	p.QuorumBufferPools = ParamItem{
+		Key:          "woodpecker.client.quorum.quorumBufferPools",
+		Version:      "2.6.0",
+		DefaultValue: "",
+		Doc: `Quorum Buffer Pools: Define groups of nodes for different purposes
+Example configuration below:
+  - name: region1 # Name of the region pool
+    seeds: [n1,n2,n3] # List of seed node addresses for this pool
+  - name: region2 # Name of the region pool
+    seeds: [n4,n5,n6] # List of seed node addresses for this pool`,
+		Export: false,
+	}
+	p.QuorumBufferPools.Init(base.mgr)
+
+	// Quorum selection strategy
+	p.QuorumAffinityMode = ParamItem{
+		Key:          "woodpecker.client.quorum.quorumSelectStrategy.affinityMode",
+		Version:      "2.6.0",
+		DefaultValue: "soft",
+		Doc:          "Affinity mode for node selection rules. Valid values: [soft, hard]",
+		Export:       false,
+	}
+	p.QuorumAffinityMode.Init(base.mgr)
+
+	p.QuorumReplicas = ParamItem{
+		Key:          "woodpecker.client.quorum.quorumSelectStrategy.replicas",
+		Version:      "2.6.0",
+		DefaultValue: "3",
+		Doc:          "Number of replicas in the quorum ensemble. Valid values: [3, 5]",
+		Export:       false,
+	}
+	p.QuorumReplicas.Init(base.mgr)
+
+	p.QuorumStrategy = ParamItem{
+		Key:          "woodpecker.client.quorum.quorumSelectStrategy.strategy",
+		Version:      "2.6.0",
+		DefaultValue: "random",
+		Doc: `Node selection strategy
+Valid values: [random, single-az-single-rg, single-az-multi-rg, multi-az-single-rg, multi-az-multi-rg, cross-region, custom]
+random: nodes are selected randomly
+single-az-single-rg: All nodes in same availability zone and resource group
+single-az-multi-rg: Same availability zone, multiple resource groups
+multi-az-single-rg: Multiple availability zones, single resource group
+multi-az-multi-rg: Multiple availability zones and resource groups
+cross-region: Nodes across different regions for maximum durability
+custom: Use custom expressions defined below`,
+		Export: false,
+	}
+	p.QuorumStrategy.Init(base.mgr)
+
+	// Custom placement for replica 1
+	p.QuorumCustomPlacement = ParamItem{
+		Key:          "woodpecker.client.quorum.quorumSelectStrategy.customPlacement",
+		Version:      "2.6.0",
+		DefaultValue: "",
+		Doc: `Custom expressions for node selection (only used when strategy is 'custom')
+Example configuration below:
+  - name: replica-1
+    region: "default-region-pool"
+    az: "az-1"
+    resourceGroup: "rg.*"
+  - name: replica-2
+    region: "default-region-pool"
+    az: "az-2"
+    resourceGroup: "rg.*"
+  - name: replica-3
+    region: "default-region-pool"
+    az: "az.*"
+    resourceGroup: "rg.*"`,
+		Export: false,
+	}
+	p.QuorumCustomPlacement.Init(base.mgr)
 
 	p.SyncMaxInterval = ParamItem{
 		Key:          "woodpecker.logstore.segmentSyncPolicy.maxInterval",
@@ -1382,6 +1468,7 @@ type MinioConfig struct {
 	SecretAccessKey    ParamItem `refreshable:"false"`
 	UseSSL             ParamItem `refreshable:"false"`
 	SslCACert          ParamItem `refreshable:"false"`
+	SslTLSMinVersion   ParamItem `refreshable:"false"`
 	BucketName         ParamItem `refreshable:"false"`
 	RootPath           ParamItem `refreshable:"false"`
 	UseIAM             ParamItem `refreshable:"false"`
@@ -1394,6 +1481,7 @@ type MinioConfig struct {
 	RequestTimeoutMs   ParamItem `refreshable:"false"`
 	MaxConnections     ParamItem `refreshable:"false"`
 	ListObjectsMaxKeys ParamItem `refreshable:"true"`
+	UseCRC32C          ParamItem `refreshable:"false"`
 }
 
 func (p *MinioConfig) Init(base *BaseTable) {
@@ -1475,6 +1563,18 @@ The default value applies to MinIO or S3 service that started with the default d
 		Export:  true,
 	}
 	p.SslCACert.Init(base.mgr)
+
+	p.SslTLSMinVersion = ParamItem{
+		Key:          "minio.ssl.tlsMinVersion",
+		DefaultValue: "default",
+		Version:      "2.6.11",
+		Doc: `TLS minimum version for MinIO/S3 SSL connections.
+Optional values: "default", "1.0", "1.1", "1.2", "1.3".
+When set to "default", the SDK/runtime default is used (typically TLS 1.2).
+We recommend using version 1.2 and above.`,
+		Export: true,
+	}
+	p.SslTLSMinVersion.Init(base.mgr)
 
 	p.BucketName = ParamItem{
 		Key:          "minio.bucketName",
@@ -1609,10 +1709,19 @@ Leave it empty if you want to use AWS default endpoint`,
 		Version:      "2.4.1",
 		DefaultValue: "0",
 		Doc: `The maximum number of objects requested per batch in minio ListObjects rpc, 
-0 means using oss client by default, decrease these configration if ListObjects timeout`,
+0 means using oss client by default, decrease these configuration if ListObjects timeout`,
 		Export: true,
 	}
 	p.ListObjectsMaxKeys.Init(base.mgr)
+
+	p.UseCRC32C = ParamItem{
+		Key:          "minio.ssl.useCRC32C",
+		Version:      "2.6.11",
+		DefaultValue: "false",
+		Doc:          "Whether to use CRC32C checksum for data integrity validation on MinIO/S3 PutObject requests.",
+		Export:       true,
+	}
+	p.UseCRC32C.Init(base.mgr)
 }
 
 // profile config

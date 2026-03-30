@@ -34,7 +34,6 @@ import (
 	"golang.org/x/sync/errgroup"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
-	"google.golang.org/protobuf/proto"
 
 	"github.com/milvus-io/milvus-proto/go-api/v2/commonpb"
 	"github.com/milvus-io/milvus-proto/go-api/v2/milvuspb"
@@ -298,13 +297,46 @@ func (sd *shardDelegator) modifySearchRequest(req *querypb.SearchRequest, scope 
 	return nodeReq
 }
 
+func (sd *shardDelegator) shallowCopyRetrieveRequest(req *internalpb.RetrieveRequest, targetID int64) *internalpb.RetrieveRequest {
+	// Create a new RetrieveRequest with the same fields
+	// Base must be a new object since each copy needs different TargetID
+	// Slices are shallow copied (same underlying array) since they are read-only after copy
+	return &internalpb.RetrieveRequest{
+		Base:                         &commonpb.MsgBase{TargetID: targetID},
+		ReqID:                        req.ReqID,
+		DbID:                         req.DbID,
+		CollectionID:                 req.CollectionID,
+		PartitionIDs:                 req.PartitionIDs,       // Shallow copy: Same underlying slice
+		SerializedExprPlan:           req.SerializedExprPlan, // Shallow copy: Same underlying byte slice
+		OutputFieldsId:               req.OutputFieldsId,     // Shallow copy: Same underlying slice
+		MvccTimestamp:                req.MvccTimestamp,
+		GuaranteeTimestamp:           req.GuaranteeTimestamp,
+		TimeoutTimestamp:             req.TimeoutTimestamp,
+		Limit:                        req.Limit,
+		IgnoreGrowing:                req.IgnoreGrowing,
+		IsCount:                      req.IsCount,
+		IterationExtensionReduceRate: req.IterationExtensionReduceRate,
+		Username:                     req.Username,
+		ReduceStopForBest:            req.ReduceStopForBest,
+		ReduceType:                   req.ReduceType,
+		ConsistencyLevel:             req.ConsistencyLevel,
+		IsIterator:                   req.IsIterator,
+		CollectionTtlTimestamps:      req.CollectionTtlTimestamps,
+		GroupByFieldIds:              req.GroupByFieldIds, // Shallow copy: Same underlying slice
+		Aggregates:                   req.Aggregates,      // Shallow copy: Same underlying slice of pointers
+		EntityTtlPhysicalTime:        req.EntityTtlPhysicalTime,
+		OrderByFields:                req.OrderByFields, // Shallow copy: Same underlying slice of pointers
+	}
+}
+
 func (sd *shardDelegator) modifyQueryRequest(req *querypb.QueryRequest, scope querypb.DataScope, segmentIDs []int64, targetID int64) *querypb.QueryRequest {
-	nodeReq := proto.Clone(req).(*querypb.QueryRequest)
-	nodeReq.Scope = scope
-	nodeReq.Req.Base.TargetID = targetID
-	nodeReq.SegmentIDs = segmentIDs
-	nodeReq.DmlChannels = []string{sd.vchannelName}
-	return nodeReq
+	return &querypb.QueryRequest{
+		Req:             sd.shallowCopyRetrieveRequest(req.GetReq(), targetID),
+		DmlChannels:     []string{sd.vchannelName},
+		SegmentIDs:      segmentIDs,
+		FromShardLeader: req.FromShardLeader,
+		Scope:           scope,
+	}
 }
 
 // Search preforms search operation on shard.
@@ -412,23 +444,24 @@ func (sd *shardDelegator) Search(ctx context.Context, req *querypb.SearchRequest
 	var err error
 	if partialResultRequiredDataRatio >= 1.0 {
 		tSafe, err = sd.waitTSafe(ctx, req.Req.GuaranteeTimestamp)
-		if err != nil {
-			log.Warn("delegator search failed to wait tsafe", zap.Error(err))
-			return nil, err
-		}
-		if req.GetReq().GetMvccTimestamp() == 0 {
-			req.Req.MvccTimestamp = tSafe
-		}
 	} else {
+		// partial search enabled, could ignore streaming data
 		tSafe = sd.GetTSafe()
-		if req.GetReq().GetMvccTimestamp() == 0 {
-			req.Req.MvccTimestamp = tSafe
-		}
 	}
 
 	metrics.QueryNodeSQLatencyWaitTSafe.WithLabelValues(
-		fmt.Sprint(paramtable.GetNodeID()), metrics.SearchLabel).
+		paramtable.GetStringNodeID(), metrics.SearchLabel).
 		Observe(float64(waitTr.ElapseSpan().Milliseconds()))
+
+	if err != nil {
+		log.Warn("delegator search failed to wait tsafe", zap.Error(err))
+		return nil, err
+	}
+
+	// use tsafe as mvcc timestamp if request not provide it
+	if req.GetReq().GetMvccTimestamp() == 0 {
+		req.Req.MvccTimestamp = tSafe
+	}
 
 	sealed, growing, sealedRowCount, version, err := sd.distribution.PinReadableSegments(partialResultRequiredDataRatio, req.GetReq().GetPartitionIDs()...)
 	if err != nil {
@@ -538,16 +571,18 @@ func (sd *shardDelegator) QueryStream(ctx context.Context, req *querypb.QueryReq
 	// wait tsafe
 	waitTr := timerecord.NewTimeRecorder("wait tSafe")
 	tSafe, err := sd.waitTSafe(ctx, req.Req.GetGuaranteeTimestamp())
+	metrics.QueryNodeSQLatencyWaitTSafe.WithLabelValues(
+		paramtable.GetStringNodeID(), metrics.QueryLabel).
+		Observe(float64(waitTr.ElapseSpan().Milliseconds()))
 	if err != nil {
 		log.Warn("delegator query failed to wait tsafe", zap.Error(err))
 		return err
 	}
+
+	// use tsafe as mvcc timestamp if request not provide it
 	if req.GetReq().GetMvccTimestamp() == 0 {
 		req.Req.MvccTimestamp = tSafe
 	}
-	metrics.QueryNodeSQLatencyWaitTSafe.WithLabelValues(
-		fmt.Sprint(paramtable.GetNodeID()), metrics.QueryLabel).
-		Observe(float64(waitTr.ElapseSpan().Milliseconds()))
 
 	sealed, growing, sealedRowCount, version, err := sd.distribution.PinReadableSegments(float64(1.0), req.GetReq().GetPartitionIDs()...)
 	if err != nil {
@@ -618,22 +653,24 @@ func (sd *shardDelegator) Query(ctx context.Context, req *querypb.QueryRequest) 
 	var err error
 	if partialResultRequiredDataRatio >= 1.0 {
 		tSafe, err = sd.waitTSafe(ctx, req.Req.GuaranteeTimestamp)
-		if err != nil {
-			log.Warn("delegator search failed to wait tsafe", zap.Error(err))
-			return nil, err
-		}
-		if req.GetReq().GetMvccTimestamp() == 0 {
-			req.Req.MvccTimestamp = tSafe
-		}
 	} else {
-		if req.GetReq().GetMvccTimestamp() == 0 {
-			req.Req.MvccTimestamp = sd.GetTSafe()
-		}
+		// partial search enabled, could ignore streaming data
+		tSafe = sd.GetTSafe()
 	}
 
 	metrics.QueryNodeSQLatencyWaitTSafe.WithLabelValues(
-		fmt.Sprint(paramtable.GetNodeID()), metrics.QueryLabel).
+		paramtable.GetStringNodeID(), metrics.QueryLabel).
 		Observe(float64(waitTr.ElapseSpan().Milliseconds()))
+
+	if err != nil {
+		log.Warn("delegator search failed to wait tsafe", zap.Error(err))
+		return nil, err
+	}
+
+	// use tsafe as mvcc timestamp if request not provide it
+	if req.GetReq().GetMvccTimestamp() == 0 {
+		req.Req.MvccTimestamp = tSafe
+	}
 
 	sealed, growing, sealedRowCount, version, err := sd.distribution.PinReadableSegments(partialResultRequiredDataRatio, req.GetReq().GetPartitionIDs()...)
 	if err != nil {
@@ -731,12 +768,23 @@ func (sd *shardDelegator) GetStatistics(ctx context.Context, req *querypb.GetSta
 	defer sd.distribution.Unpin(version)
 
 	tasks, err := organizeSubTask(ctx, req, sealed, growing, sd, true, func(req *querypb.GetStatisticsRequest, scope querypb.DataScope, segmentIDs []int64, targetID int64) *querypb.GetStatisticsRequest {
-		nodeReq := proto.Clone(req).(*querypb.GetStatisticsRequest)
-		nodeReq.GetReq().GetBase().TargetID = targetID
-		nodeReq.Scope = scope
-		nodeReq.SegmentIDs = segmentIDs
-		nodeReq.FromShardLeader = true
-		return nodeReq
+		// Shallow copy inner request with new Base (each copy needs different TargetID)
+		innerReq := req.GetReq()
+		return &querypb.GetStatisticsRequest{
+			Req: &internalpb.GetStatisticsRequest{
+				Base:               &commonpb.MsgBase{TargetID: targetID},
+				DbID:               innerReq.GetDbID(),
+				CollectionID:       innerReq.GetCollectionID(),
+				PartitionIDs:       innerReq.GetPartitionIDs(), // Shallow copy: Same underlying slice
+				TravelTimestamp:    innerReq.GetTravelTimestamp(),
+				GuaranteeTimestamp: innerReq.GetGuaranteeTimestamp(),
+				TimeoutTimestamp:   innerReq.GetTimeoutTimestamp(),
+			},
+			DmlChannels:     req.GetDmlChannels(), // Shallow copy: Same underlying slice
+			SegmentIDs:      segmentIDs,
+			FromShardLeader: true,
+			Scope:           scope,
+		}
 	})
 	if err != nil {
 		log.Warn("Get statistics organizeSubTask failed", zap.Error(err))
@@ -1171,8 +1219,8 @@ func (sd *shardDelegator) Close() {
 	sd.deleteBuffer.Clear()
 	log.Info("unregister all l0 segments", zap.Duration("cost", time.Since(start)))
 
-	metrics.QueryNodeDeleteBufferSize.DeleteLabelValues(fmt.Sprint(paramtable.GetNodeID()), sd.vchannelName)
-	metrics.QueryNodeDeleteBufferRowNum.DeleteLabelValues(fmt.Sprint(paramtable.GetNodeID()), sd.vchannelName)
+	metrics.QueryNodeDeleteBufferSize.DeleteLabelValues(paramtable.GetStringNodeID(), sd.vchannelName)
+	metrics.QueryNodeDeleteBufferRowNum.DeleteLabelValues(paramtable.GetStringNodeID(), sd.vchannelName)
 }
 
 // As partition stats is an optimization for search/query which is not mandatory for milvus instance,
@@ -1258,7 +1306,7 @@ func NewShardDelegator(ctx context.Context, collectionID UniqueID, replicaID Uni
 		lifetime:       lifetime.NewLifetime(lifetime.Initializing),
 		distribution:   NewDistribution(channel, queryView),
 		deleteBuffer: deletebuffer.NewListDeleteBuffer[*deletebuffer.Item](startTs, sizePerBlock,
-			[]string{fmt.Sprint(paramtable.GetNodeID()), channel}),
+			[]string{paramtable.GetStringNodeID(), channel}),
 		latestTsafe:                atomic.NewUint64(startTs),
 		loader:                     loader,
 		queryHook:                  queryHook,

@@ -123,7 +123,7 @@ JsonStatsParquetWriter::Init(const ParquetWriteContext& context) {
                    result.status().ToString());
     packed_writer_ = result.ValueOrDie();
     for (const auto& [key, value] : kv_metadata_) {
-        packed_writer_->AddUserMetadata(key, value);
+        (void)packed_writer_->AddUserMetadata(key, value);
     }
 }
 
@@ -161,7 +161,7 @@ JsonStatsParquetWriter::AppendValue(const std::string& key,
             ErrorCode::UnexpectedError, "builder for key {} not found", key);
     }
 
-    auto builder = it->second;
+    auto& builder = it->second;
     auto ast = AppendDataToBuilder(value, builder);
     AssertInfo(ast.ok(), "failed to append data to builder");
 }
@@ -177,7 +177,7 @@ JsonStatsParquetWriter::AppendRow(
                       key);
         }
 
-        auto builder = it->second;
+        auto& builder = it->second;
         auto status = AppendDataToBuilder(value, builder);
         AssertInfo(status.ok(), "failed to append data to builder");
     }

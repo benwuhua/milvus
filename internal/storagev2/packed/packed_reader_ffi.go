@@ -44,6 +44,7 @@ func NewFFIPackedReader(manifestPath string, schema *arrow.Schema, neededColumns
 	if err != nil {
 		return nil, errors.Wrap(err, "failed to get manifest")
 	}
+	defer C.loon_manifest_destroy(cLoonManifest)
 
 	var cas cdata.CArrowSchema
 	cdata.ExportArrowSchema(schema, &cas)
@@ -84,6 +85,8 @@ func NewFFIPackedReader(manifestPath string, schema *arrow.Schema, neededColumns
 			gcp_credential_json:    C.CString(storageConfig.GetGcpCredentialJSON()),
 			use_custom_part_upload: true,
 			max_connections:        C.uint32_t(storageConfig.GetMaxConnections()),
+			tls_min_version:        C.CString(tlsMinVersionForStorage(storageConfig.GetSslTlsMinVersion())),
+			use_crc32c_checksum:    C.bool(storageConfig.GetUseCrc32CChecksum()),
 		}
 		defer C.free(unsafe.Pointer(cStorageConfig.address))
 		defer C.free(unsafe.Pointer(cStorageConfig.bucket_name))
@@ -97,6 +100,7 @@ func NewFFIPackedReader(manifestPath string, schema *arrow.Schema, neededColumns
 		defer C.free(unsafe.Pointer(cStorageConfig.sslCACert))
 		defer C.free(unsafe.Pointer(cStorageConfig.region))
 		defer C.free(unsafe.Pointer(cStorageConfig.gcp_credential_json))
+		defer C.free(unsafe.Pointer(cStorageConfig.tls_min_version))
 
 		cNeededColumn := make([]*C.char, len(neededColumns))
 		for i, columnName := range neededColumns {
@@ -159,6 +163,10 @@ func (r *FFIPackedReader) ReadNext() (arrow.Record, error) {
 
 // Close closes the FFI reader
 func (r *FFIPackedReader) Close() error {
+	if r.cPackedReader == nil {
+		return nil
+	}
+
 	// no need to manual release current batch
 	// stream reader handles it
 
@@ -167,6 +175,7 @@ func (r *FFIPackedReader) Close() error {
 	}
 
 	status := C.CloseFFIReader(r.cPackedReader)
+	r.cPackedReader = nil
 	return ConsumeCStatusIntoError(&status)
 }
 
@@ -186,7 +195,7 @@ func (r *FFIPackedReader) Release() {
 
 func GetManifestHandle(manifestPath string, storageConfig *indexpb.StorageConfig) (loonManifestHandle *C.LoonManifest, err error) {
 	var cManifestHandle *C.LoonManifest
-	basePath, version, err := UnmarshalManfestPath(manifestPath)
+	basePath, version, err := UnmarshalManifestPath(manifestPath)
 	if err != nil {
 		return cManifestHandle, err
 	}
@@ -196,11 +205,12 @@ func GetManifestHandle(manifestPath string, storageConfig *indexpb.StorageConfig
 	if err != nil {
 		return cManifestHandle, err
 	}
+	defer C.loon_properties_free(cProperties)
 	cBasePath := C.CString(basePath)
 	defer C.free(unsafe.Pointer(cBasePath))
 
 	var cTransactionHandle C.LoonTransactionHandle
-	result := C.loon_transaction_begin(cBasePath, cProperties, C.int64_t(version), 1, &cTransactionHandle)
+	result := C.loon_transaction_begin(cBasePath, cProperties, C.int64_t(version), C.int32_t(0) /* resolve_id */, C.uint32_t(1) /* retry_limit */, &cTransactionHandle)
 	err = HandleLoonFFIResult(result)
 	if err != nil {
 		return cManifestHandle, err

@@ -51,6 +51,7 @@ type IDFOracle interface {
 
 	RegisterGrowing(segmentID int64, stats bm25Stats)
 	RegisterSealed(segmentID int64, stats bm25Stats) error
+	UnregisterSealed(segmentIDs ...int64)
 
 	BuildIDF(fieldID int64, tfs *schemapb.SparseFloatArray) ([][]byte, float64, error)
 
@@ -129,21 +130,19 @@ func (s *sealedBm25Stats) writeFile(localDir string) (error, bool) {
 	// RUnlock when stats serialize and write to file
 	// to avoid block remove stats too long when sync distribution
 	for fieldID, stats := range stats {
-		file, err := os.Create(path.Join(localDir, fmt.Sprintf("%d.data", fieldID)))
-		if err != nil {
-			return err, false
-		}
+		if err := func() error {
+			file, err := os.Create(path.Join(localDir, fmt.Sprintf("%d.data", fieldID)))
+			if err != nil {
+				return err
+			}
+			defer file.Close()
 
-		defer file.Close()
-		writer := bufio.NewWriter(file)
-
-		err = stats.SerializeToWriter(writer)
-		if err != nil {
-			return err, false
-		}
-
-		err = writer.Flush()
-		if err != nil {
+			writer := bufio.NewWriter(file)
+			if err = stats.SerializeToWriter(writer); err != nil {
+				return err
+			}
+			return writer.Flush()
+		}(); err != nil {
 			return err, false
 		}
 	}
@@ -354,6 +353,14 @@ func (o *idfOracle) RegisterSealed(segmentID int64, stats bm25Stats) error {
 		return err
 	}
 	return nil
+}
+
+func (o *idfOracle) UnregisterSealed(segmentIDs ...int64) {
+	for _, segmentID := range segmentIDs {
+		if stats, ok := o.sealed.GetAndRemove(segmentID); ok {
+			stats.Remove()
+		}
+	}
 }
 
 func (o *idfOracle) UpdateGrowing(segmentID int64, stats bm25Stats) {

@@ -1261,12 +1261,10 @@ LoadArrowReaderFromRemote(const std::vector<std::string>& remote_files,
 
         auto codec_futures = storage::GetObjectData(
             rcm.get(), remote_files, milvus::PriorityForLoad(priority), false);
-        // Wait for all futures to ensure all threads complete
-        auto codecs = storage::WaitAllFutures(std::move(codec_futures));
-        for (auto& codec : codecs) {
-            auto reader = codec->GetReader();
-            channel->push(reader);
-        }
+        storage::ProcessFuturesInOrder(
+            codec_futures, [&](std::unique_ptr<storage::DataCodec> codec) {
+                channel->push(codec->GetReader());
+            });
         channel->close();
     } catch (std::exception& e) {
         LOG_INFO("failed to load data from remote: {}", e.what());
@@ -1283,12 +1281,10 @@ LoadFieldDatasFromRemote(const std::vector<std::string>& remote_files,
                        .GetRemoteChunkManager();
         auto codec_futures = storage::GetObjectData(
             rcm.get(), remote_files, milvus::PriorityForLoad(priority));
-        // Wait for all futures to ensure all threads complete
-        auto codecs = storage::WaitAllFutures(std::move(codec_futures));
-        for (auto& codec : codecs) {
-            auto field_data = codec->GetFieldData();
-            channel->push(field_data);
-        }
+        storage::ProcessFuturesInOrder(
+            codec_futures, [&](std::unique_ptr<storage::DataCodec> codec) {
+                channel->push(codec->GetFieldData());
+            });
         channel->close();
     } catch (std::exception& e) {
         LOG_INFO("failed to load data from remote: {}", e.what());
@@ -1331,6 +1327,8 @@ getCacheWarmupPolicy(const std::string& warmup_policy,
             return CacheWarmupPolicy::CacheWarmupPolicy_Disable;
         } else if (warmup_policy == "sync") {
             return CacheWarmupPolicy::CacheWarmupPolicy_Sync;
+        } else if (warmup_policy == "async") {
+            return CacheWarmupPolicy::CacheWarmupPolicy_Async;
         }
         // Unknown policy string, should not happen, been checked by milvus proxy side
         AssertInfo(false, "Unknown warmup policy '{}'", warmup_policy);
@@ -1597,6 +1595,6 @@ bulk_script_field_data(milvus::OpContext* op_ctx,
         }
     }
 
-    return std::move(ret);
+    return ret;
 }
 }  // namespace milvus::segcore

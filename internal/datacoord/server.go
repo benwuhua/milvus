@@ -23,7 +23,6 @@ import (
 	"os"
 	"sync"
 	"sync/atomic"
-	"syscall"
 	"time"
 
 	"github.com/blang/semver/v4"
@@ -36,7 +35,6 @@ import (
 
 	"github.com/milvus-io/milvus-proto/go-api/v2/commonpb"
 	"github.com/milvus-io/milvus-proto/go-api/v2/milvuspb"
-	"github.com/milvus-io/milvus-proto/go-api/v2/msgpb"
 	globalIDAllocator "github.com/milvus-io/milvus/internal/allocator"
 	"github.com/milvus-io/milvus/internal/datacoord/allocator"
 	"github.com/milvus-io/milvus/internal/datacoord/broker"
@@ -47,23 +45,16 @@ import (
 	"github.com/milvus-io/milvus/internal/kv/tikv"
 	"github.com/milvus-io/milvus/internal/metastore/kv/datacoord"
 	"github.com/milvus-io/milvus/internal/storage"
-	"github.com/milvus-io/milvus/internal/streamingcoord/server/balancer/balance"
-	"github.com/milvus-io/milvus/internal/streamingcoord/server/broadcaster/registry"
 	"github.com/milvus-io/milvus/internal/types"
 	"github.com/milvus-io/milvus/internal/util/dependency"
-	"github.com/milvus-io/milvus/internal/util/importutilv2"
 	"github.com/milvus-io/milvus/internal/util/sessionutil"
-	"github.com/milvus-io/milvus/internal/util/streamingutil/status"
 	"github.com/milvus-io/milvus/pkg/v2/kv"
 	"github.com/milvus-io/milvus/pkg/v2/log"
 	"github.com/milvus-io/milvus/pkg/v2/metrics"
 	"github.com/milvus-io/milvus/pkg/v2/proto/datapb"
-	"github.com/milvus-io/milvus/pkg/v2/proto/internalpb"
 	"github.com/milvus-io/milvus/pkg/v2/proto/querypb"
-	"github.com/milvus-io/milvus/pkg/v2/streaming/util/message"
 	"github.com/milvus-io/milvus/pkg/v2/util"
 	"github.com/milvus-io/milvus/pkg/v2/util/expr"
-	"github.com/milvus-io/milvus/pkg/v2/util/funcutil"
 	"github.com/milvus-io/milvus/pkg/v2/util/logutil"
 	"github.com/milvus-io/milvus/pkg/v2/util/merr"
 	"github.com/milvus-io/milvus/pkg/v2/util/metricsinfo"
@@ -162,11 +153,11 @@ type Server struct {
 	// segReferManager  *SegmentReferenceManager
 	indexEngineVersionManager IndexEngineVersionManager
 
-	statsInspector              *statsInspector
-	indexInspector              *indexInspector
-	analyzeInspector            *analyzeInspector
-	externalCollectionInspector *externalCollectionInspector
-	globalScheduler             task.GlobalScheduler
+	statsInspector                   *statsInspector
+	indexInspector                   *indexInspector
+	analyzeInspector                 *analyzeInspector
+	externalCollectionRefreshManager ExternalCollectionRefreshManager
+	globalScheduler                  task.GlobalScheduler
 
 	// manage ways that data coord access other coord
 	broker broker.Broker
@@ -340,9 +331,8 @@ func (s *Server) initDataCoord() error {
 	s.initStatsInspector()
 	log.Info("init statsJobManager done")
 
-	// TODO: enable external collection inspector
-	// s.initExternalCollectionInspector()
-	// log.Info("init external collection inspector done")
+	s.initExternalCollectionInspector()
+	log.Info("init external collection inspector done")
 
 	if err = s.initSegmentManager(); err != nil {
 		return err
@@ -353,7 +343,7 @@ func (s *Server) initDataCoord() error {
 
 	s.importInspector = NewImportInspector(s.ctx, s.meta, s.importMeta, s.globalScheduler)
 
-	s.importChecker = NewImportChecker(s.ctx, s.meta, s.broker, s.allocator, s.importMeta, s.compactionInspector, s.handler, s.compactionTriggerManager)
+	s.importChecker = NewImportChecker(s.ctx, s.meta, s.broker, s.allocator, s.importMeta, s.compactionInspector, s.handler)
 
 	// init file resource observer
 	if s.fileResourceObserver != nil {
@@ -361,7 +351,7 @@ func (s *Server) initDataCoord() error {
 	}
 
 	// Initialize copy segment meta and components
-	s.copySegmentMeta, err = NewCopySegmentMeta(s.ctx, s.meta.catalog, s.meta, s.meta.snapshotMeta)
+	s.copySegmentMeta, err = NewCopySegmentMeta(s.ctx, s.meta.catalog, s.meta, s.meta.snapshotMeta, s.allocator)
 	if err != nil {
 		return err
 	}
@@ -398,77 +388,7 @@ func (s *Server) initDataCoord() error {
 	RegisterDDLCallbacks(s)
 	log.Info("init datacoord done", zap.Int64("nodeID", paramtable.GetNodeID()), zap.String("Address", s.address))
 
-	s.initMessageCallback()
 	return nil
-}
-
-// initMessageCallback initializes the message callback.
-// TODO: we should build a ddl framework to handle the message ack callback for ddl messages
-func (s *Server) initMessageCallback() {
-	registry.RegisterImportV1AckCallback(func(ctx context.Context, result message.BroadcastResultImportMessageV1) error {
-		body := result.Message.MustBody()
-		if body.Schema != nil {
-			body.Schema.DbName = body.DbName
-		}
-		vchannels := result.GetVChannelsWithoutControlChannel()
-		importResp, err := s.ImportV2(ctx, &internalpb.ImportRequestInternal{
-			CollectionID:   body.GetCollectionID(),
-			CollectionName: body.GetCollectionName(),
-			PartitionIDs:   body.GetPartitionIDs(),
-			ChannelNames:   vchannels,
-			Schema:         body.GetSchema(),
-			Files: lo.Map(body.GetFiles(), func(file *msgpb.ImportFile, _ int) *internalpb.ImportFile {
-				return &internalpb.ImportFile{
-					Id:    file.GetId(),
-					Paths: file.GetPaths(),
-				}
-			}),
-			Options:       funcutil.Map2KeyValuePair(body.GetOptions()),
-			DataTimestamp: body.GetBase().GetTimestamp(),
-			JobID:         body.GetJobID(),
-		})
-		err = merr.CheckRPCCall(importResp, err)
-		if errors.Is(err, merr.ErrCollectionNotFound) {
-			log.Ctx(ctx).Warn("import message failed because of collection not found, skip it", zap.String("job_id", importResp.GetJobID()), zap.Error(err))
-			return nil
-		}
-		if err != nil {
-			log.Ctx(ctx).Warn("import message failed", zap.String("job_id", importResp.GetJobID()), zap.Error(err))
-			return err
-		}
-		log.Ctx(ctx).Info("import message handled", zap.String("job_id", importResp.GetJobID()))
-		return nil
-	})
-
-	registry.RegisterImportV1CheckCallback(func(ctx context.Context, msg message.BroadcastImportMessageV1) error {
-		b := msg.MustBody()
-		options := funcutil.Map2KeyValuePair(b.GetOptions())
-		_, err := importutilv2.GetTimeoutTs(options)
-		if err != nil {
-			return err
-		}
-		err = ValidateBinlogImportRequest(ctx, s.meta.chunkManager, b.GetFiles(), options)
-		if err != nil {
-			return err
-		}
-		err = ValidateMaxImportJobExceed(ctx, s.importMeta)
-		if err != nil {
-			return err
-		}
-		balancer, err := balance.GetWithContext(ctx)
-		if err != nil {
-			return err
-		}
-		channelAssignment, err := balancer.GetLatestChannelAssignment()
-		if err != nil {
-			return err
-		}
-		replicateConfig := channelAssignment.ReplicateConfiguration
-		if replicateConfig != nil && len(replicateConfig.GetClusters()) > 1 {
-			return status.NewReplicateViolation("import in replicating cluster is not supported yet")
-		}
-		return nil
-	})
 }
 
 // Start initialize `Server` members and start loops, follow steps are taken:
@@ -659,13 +579,13 @@ func (s *Server) initSegmentManager() error {
 func (s *Server) initSession() error {
 	if s.icSession == nil {
 		s.icSession = sessionutil.NewSession(s.ctx)
-		s.icSession.Init(typeutil.IndexCoordRole, s.address, true, true)
+		s.icSession.Init(typeutil.IndexCoordRole, s.address, true)
 		s.icSession.SetEnableActiveStandBy(s.enableActiveStandBy)
 	}
 	if s.session == nil {
 		s.session = sessionutil.NewSession(s.ctx)
 
-		s.session.Init(typeutil.DataCoordRole, s.address, true, true)
+		s.session.Init(typeutil.DataCoordRole, s.address, true)
 		s.session.SetEnableActiveStandBy(s.enableActiveStandBy)
 	}
 	return nil
@@ -737,16 +657,18 @@ func (s *Server) initStatsInspector() {
 }
 
 func (s *Server) initExternalCollectionInspector() {
-	if s.externalCollectionInspector == nil {
-		s.externalCollectionInspector = newExternalCollectionInspector(s.ctx, s.meta, s.globalScheduler, s.allocator)
+	// Initialize Manager (handles job submission, query, and internal inspector/checker)
+	if s.externalCollectionRefreshManager == nil {
+		s.externalCollectionRefreshManager = NewExternalCollectionRefreshManager(
+			s.ctx, s.meta, s.globalScheduler, s.allocator, s.meta.externalCollectionRefreshMeta, s.handler.GetCollection)
 	}
 }
 
 func (s *Server) initCompaction() {
-	cph := newCompactionInspector(s.meta, s.allocator, s.handler, s.globalScheduler, s.indexEngineVersionManager)
+	cph := newCompactionInspector(s.meta, s.allocator, s.handler, s.globalScheduler, s.globalScheduler, s.indexEngineVersionManager)
 	cph.loadMeta()
 	s.compactionInspector = cph
-	s.compactionTriggerManager = NewCompactionTriggerManager(s.allocator, s.handler, s.compactionInspector, s.meta, s.importMeta, s.indexEngineVersionManager)
+	s.compactionTriggerManager = NewCompactionTriggerManager(s.allocator, s.handler, s.compactionInspector, s.meta, s.indexEngineVersionManager)
 	s.compactionTriggerManager.InitForceMergeMemoryQuerier(s.nodeManager, s.mixCoord, s.session)
 	s.compactionTrigger = newCompactionTrigger(s.meta, s.compactionInspector, s.allocator, s.handler, s.indexEngineVersionManager)
 }
@@ -794,6 +716,9 @@ func (s *Server) startServerLoop() {
 	go s.copySegmentInspector.Start()
 	go s.copySegmentChecker.Start()
 
+	// Start external collection refresh manager (includes inspector and checker)
+	s.externalCollectionRefreshManager.Start()
+
 	s.garbageCollector.start()
 }
 
@@ -823,8 +748,7 @@ func (s *Server) startTaskScheduler() {
 	s.statsInspector.Start()
 	s.indexInspector.Start()
 	s.analyzeInspector.Start()
-	// TODO: enable external collection inspector
-	// s.externalCollectionInspector.Start()
+	// Note: externalCollectionInspector.Start() is called in startServerLoop as a goroutine
 	s.startCollectMetaMetrics(s.serverLoopCtx)
 }
 
@@ -856,11 +780,12 @@ func (s *Server) startWatchService(ctx context.Context) {
 func (s *Server) stopServiceWatch() {
 	// ErrCompacted is handled inside SessionWatcher, which means there is some other error occurred, closing server.
 	log.Ctx(s.ctx).Error("watch service channel closed", zap.Int64("serverID", paramtable.GetNodeID()))
-	go s.Stop()
-	if s.session.IsTriggerKill() {
-		if p, err := os.FindProcess(os.Getpid()); err == nil {
-			p.Signal(syscall.SIGINT)
-		}
+	if s.ctx.Err() == nil {
+		// ctx is still active, meaning this is not a normal shutdown but a genuine watch failure.
+		// Force exit so the process can be restarted by the orchestrator (e.g. K8s).
+		log.Ctx(s.ctx).Error("force exit due to unexpected watch service failure")
+		log.Cleanup()
+		os.Exit(sessionutil.ExitCodeEtcd)
 	}
 }
 
@@ -1155,9 +1080,8 @@ func (s *Server) Stop() error {
 	if s.qnSessionWatcher != nil {
 		s.qnSessionWatcher.Stop()
 	}
-	// TODO: enable external collection inspector
-	// s.externalCollectionInspector.Stop()
-	// log.Info("datacoord external collection inspector stopped")
+	s.externalCollectionRefreshManager.Stop()
+	log.Info("datacoord external collection refresh manager stopped")
 
 	if s.session != nil {
 		s.session.Stop()

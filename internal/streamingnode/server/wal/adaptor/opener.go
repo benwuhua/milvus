@@ -225,11 +225,22 @@ func (o *openerAdaptorImpl) openRWWAL(ctx context.Context, l walimpls.WALImpls, 
 		InitialRecoverSnapshot: snapshot,
 		TxnManager:             param.TxnManager,
 	})
+	// Load salvage checkpoints from etcd (one per source cluster that was force-promoted from).
+	var salvageCheckpoints []*utility.ReplicateCheckpoint
+	if salvageCPProtos, err := resource.Resource().StreamingNodeCatalog().GetSalvageCheckpoint(ctx, param.ChannelInfo.Name); err != nil {
+		log.Ctx(ctx).Info("failed to load salvage checkpoints", zap.Error(err))
+	} else {
+		for _, proto := range salvageCPProtos {
+			salvageCheckpoints = append(salvageCheckpoints, utility.NewReplicateCheckpointFromProto(proto))
+		}
+	}
+
 	if param.ReplicateManager, err = replicates.RecoverReplicateManager(
 		&replicates.ReplicateManagerRecoverParam{
 			ChannelInfo:            param.ChannelInfo,
 			CurrentClusterID:       paramtable.Get().CommonCfg.ClusterPrefix.GetValue(),
 			InitialRecoverSnapshot: snapshot,
+			SalvageCheckpoints:     salvageCheckpoints,
 		},
 	); err != nil {
 		return nil, err
@@ -239,10 +250,11 @@ func (o *openerAdaptorImpl) openRWWAL(ctx context.Context, l walimpls.WALImpls, 
 	var flusher *flusherimpl.WALFlusherImpl
 	if !opt.DisableFlusher {
 		flusher = flusherimpl.RecoverWALFlusher(&flusherimpl.RecoverWALFlusherParam{
-			WAL:              param.WAL,
-			RecoveryStorage:  rs,
-			ChannelInfo:      l.Channel(),
-			RecoverySnapshot: snapshot,
+			WAL:                param.WAL,
+			RecoveryStorage:    rs,
+			ChannelInfo:        l.Channel(),
+			RecoverySnapshot:   snapshot,
+			RateLimitComponent: roWAL.WALRateLimitComponent,
 		})
 	}
 	wal := adaptImplsToRWWAL(roWAL, o.interceptorBuilders, param, flusher)

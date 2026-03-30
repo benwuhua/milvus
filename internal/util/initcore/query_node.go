@@ -65,12 +65,17 @@ func doInitQueryNodeOnce(ctx context.Context) error {
 	C.SegcoreInit(cGlogConf)
 	C.free(unsafe.Pointer(cGlogConf))
 
+	C.LogOpenSSLFIPSStatus()
+
 	// update log level based on current setup
 	UpdateLogLevel(paramtable.Get().LogCfg.Level.GetValue())
 
 	// override segcore chunk size
 	cChunkRows := C.int64_t(paramtable.Get().QueryNodeCfg.ChunkRows.GetAsInt64())
 	C.SegcoreSetChunkRows(cChunkRows)
+
+	cMaxGroupByGroups := C.int64_t(paramtable.Get().CommonCfg.GroupByMaxGroups.GetAsInt64())
+	C.SegcoreSetMaxGroupByGroups(cMaxGroupByGroups)
 
 	cKnowhereThreadPoolSize := C.uint32_t(paramtable.Get().QueryNodeCfg.KnowhereThreadPoolSize.GetAsUint32())
 	C.SegcoreSetKnowhereSearchThreadPoolNum(cKnowhereThreadPoolSize)
@@ -99,6 +104,8 @@ func doInitQueryNodeOnce(ctx context.Context) error {
 	C.SetMiddlePriorityThreadCoreCoefficient(cMiddlePriorityThreadCoreCoefficient)
 	cLowPriorityThreadCoreCoefficient := C.float(paramtable.Get().CommonCfg.LowPriorityThreadCoreCoefficient.GetAsFloat())
 	C.SetLowPriorityThreadCoreCoefficient(cLowPriorityThreadCoreCoefficient)
+	cThreadPoolMaxThreadsSize := C.int(paramtable.Get().CommonCfg.ThreadPoolMaxThreadsSize.GetAsInt())
+	C.SetThreadPoolMaxThreadsSize(cThreadPoolMaxThreadsSize)
 
 	cCPUNum := C.int(hardware.GetCPUNum())
 	C.InitCpuNum(cCPUNum)
@@ -141,8 +148,8 @@ func doInitQueryNodeOnce(ctx context.Context) error {
 	cExprResCacheCapacityBytes := C.int64_t(paramtable.Get().QueryNodeCfg.ExprResCacheCapacityBytes.GetAsInt64())
 	C.SetExprResCacheCapacityBytes(cExprResCacheCapacityBytes)
 
-	cEnableParquetStatsSkipIndex := C.bool(paramtable.Get().CommonCfg.EnableNamespace.GetAsBool())
-	C.SetDefaultEnableParquetStatsSkipIndex(cEnableParquetStatsSkipIndex)
+	enableParquetStatsSkipIndex := paramtable.Get().CommonCfg.ParquetStatsSkipIndex.GetAsBool()
+	C.SetDefaultEnableParquetStatsSkipIndex(C.bool(enableParquetStatsSkipIndex))
 
 	localDataRootPath := pathutil.GetPath(pathutil.LocalChunkPath, nodeID)
 

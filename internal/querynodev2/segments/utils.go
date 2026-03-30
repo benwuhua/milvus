@@ -1,24 +1,11 @@
 package segments
 
-/*
-#cgo pkg-config: milvus_core
-
-#include "segcore/collection_c.h"
-#include "segcore/segment_c.h"
-#include "segcore/segcore_init_c.h"
-#include "common/init_c.h"
-
-*/
-import "C"
-
 import (
 	"bytes"
-	"context"
 	"encoding/binary"
 	"fmt"
 	"io"
 	"strconv"
-	"time"
 
 	"github.com/cockroachdb/errors"
 	"go.uber.org/zap"
@@ -35,9 +22,7 @@ import (
 	"github.com/milvus-io/milvus/pkg/v2/proto/datapb"
 	"github.com/milvus-io/milvus/pkg/v2/proto/internalpb"
 	"github.com/milvus-io/milvus/pkg/v2/proto/querypb"
-	"github.com/milvus-io/milvus/pkg/v2/util/contextutil"
 	"github.com/milvus-io/milvus/pkg/v2/util/merr"
-	"github.com/milvus-io/milvus/pkg/v2/util/paramtable"
 	"github.com/milvus-io/milvus/pkg/v2/util/typeutil"
 )
 
@@ -183,15 +168,6 @@ func mergeRequestCost(requestCosts []*internalpb.CostAggregation) *internalpb.Co
 	return result
 }
 
-func getIndexEngineVersion() (minimal, current int32) {
-	GetDynamicPool().Submit(func() (any, error) {
-		cMinimal, cCurrent := C.GetMinimalIndexVersion(), C.GetCurrentIndexVersion()
-		minimal, current = int32(cMinimal), int32(cCurrent)
-		return nil, nil
-	}).Await()
-	return minimal, current
-}
-
 // getSegmentMetricLabel returns the label for segment metrics.
 func getSegmentMetricLabel(segment Segment) metricsutil.SegmentLabel {
 	return metricsutil.SegmentLabel{
@@ -208,13 +184,6 @@ func FilterZeroValuesFromSlice(intVals []int64) []int64 {
 		}
 	}
 	return result
-}
-
-// withLazyLoadTimeoutContext returns a new context with lazy load timeout.
-func withLazyLoadTimeoutContext(ctx context.Context) (context.Context, context.CancelFunc) {
-	lazyLoadTimeout := paramtable.Get().QueryNodeCfg.LazyLoadWaitTimeout.GetAsDuration(time.Millisecond)
-	// TODO: use context.WithTimeoutCause instead of contextutil.WithTimeoutCause in go1.21
-	return contextutil.WithTimeoutCause(ctx, lazyLoadTimeout, errLazyLoadTimeout)
 }
 
 func GetSegmentRelatedDataSize(segment Segment) int64 {
@@ -324,12 +293,11 @@ func isGrowingMmapEnable() bool {
 }
 
 // getFieldWarmupPolicy returns the warmup policy for field data loading.
-// Priority: field TypeParams (propagated from collection-level by QueryCoord) > global config
+// Priority: field TypeParams (propagated from collection-level by QueryCoord, including autoWarmupForNonPKIsolationCollection) > global config
 func getFieldWarmupPolicy(fieldSchema *schemapb.FieldSchema) string {
 	// Check field TypeParams (collection-level warmup.scalarField/warmup.vectorField
-	// is propagated to field TypeParams by QueryCoord)
+	// and autoWarmupForNonPKIsolationCollection are propagated to field TypeParams by QueryCoord)
 	policy, exist := common.GetWarmupPolicy(fieldSchema.GetTypeParams()...)
-
 	if exist {
 		return policy
 	}
@@ -341,10 +309,10 @@ func getFieldWarmupPolicy(fieldSchema *schemapb.FieldSchema) string {
 }
 
 // getIndexWarmupPolicy returns the warmup policy for index loading.
-// Priority: index params (propagated from collection-level by QueryCoord) > global config
+// Priority: index params (propagated from collection-level by QueryCoord, including autoWarmupForNonPKIsolationCollection) > global config
 func getIndexWarmupPolicy(fieldSchema *schemapb.FieldSchema, indexInfo *querypb.FieldIndexInfo) string {
 	// Check index params (collection-level warmup.scalarIndex/warmup.vectorIndex
-	// is propagated to index params by QueryCoord)
+	// and autoWarmupForNonPKIsolationCollection are propagated to index params by QueryCoord)
 	policy, exist := common.GetWarmupPolicy(indexInfo.IndexParams...)
 	if exist {
 		return policy
@@ -357,9 +325,9 @@ func getIndexWarmupPolicy(fieldSchema *schemapb.FieldSchema, indexInfo *querypb.
 }
 
 // getScalarDataWarmupPolicy returns the warmup policy for scalar data, but also include json key stats and text match.
-// Priority: field TypeParams (propagated from collection-level by QueryCoord) > global config
+// Priority: field TypeParams (propagated from collection-level by QueryCoord, including autoWarmupForNonPKIsolationCollection) > global config
 func getScalarDataWarmupPolicy(fieldSchema *schemapb.FieldSchema) string {
-	// Check field TypeParams (collection-level warmup.scalarField is propagated
+	// Check field TypeParams (collection-level warmup.scalarField and autoWarmupForNonPKIsolationCollection are propagated by QueryCoord)
 	policy, exist := common.GetWarmupPolicy(fieldSchema.GetTypeParams()...)
 	if exist {
 		return policy

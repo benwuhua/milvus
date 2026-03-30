@@ -98,12 +98,12 @@ class BitmapIndex : public ScalarIndex<T> {
     IsNotNull() override;
 
     const TargetBitmap
-    Range(T value, OpType op) override;
+    Range(const T& value, OpType op) override;
 
     const TargetBitmap
-    Range(T lower_bound_value,
+    Range(const T& lower_bound_value,
           bool lb_inclusive,
-          T upper_bound_value,
+          const T& upper_bound_value,
           bool ub_inclusive) override;
 
     std::optional<T>
@@ -195,9 +195,59 @@ class BitmapIndex : public ScalarIndex<T> {
     const TargetBitmap
     Query(const DatasetPtr& dataset) override;
 
+    void
+    WriteEntries(storage::IndexEntryWriter* writer) override;
+
+    void
+    LoadEntries(storage::IndexEntryReader& reader,
+                const Config& config) override;
+
     bool
     SupportPatternMatch() const override {
-        return SupportRegexQuery();
+        return std::is_same_v<T, std::string>;
+    }
+
+    bool
+    SupportPatternQuery() const override {
+        return std::is_same_v<T, std::string>;
+    }
+
+    const TargetBitmap
+    PatternQuery(const std::string& pattern) override {
+        if constexpr (!std::is_same_v<T, std::string>) {
+            ThrowInfo(ErrorCode::OpTypeInvalid,
+                      "pattern query only supported for string type");
+            return TargetBitmap{};
+        } else {
+            AssertInfo(is_built_, "index has not been built");
+
+            LikePatternMatcher matcher(pattern);
+            TargetBitmap res(total_num_rows_, false);
+            if (is_mmap_) {
+                for (const auto& [key, bitmap] : bitmap_info_map_) {
+                    if (matcher(key)) {
+                        for (const auto& v : bitmap) {
+                            res.set(v);
+                        }
+                    }
+                }
+            } else if (build_mode_ == BitmapIndexBuildMode::ROARING) {
+                for (const auto& [key, bitmap] : data_) {
+                    if (matcher(key)) {
+                        for (const auto& v : bitmap) {
+                            res.set(v);
+                        }
+                    }
+                }
+            } else {
+                for (const auto& [key, bitset] : bitsets_) {
+                    if (matcher(key)) {
+                        res |= bitset;
+                    }
+                }
+            }
+            return res;
+        }
     }
 
     const TargetBitmap
@@ -212,24 +262,14 @@ class BitmapIndex : public ScalarIndex<T> {
                 return Query(std::move(dataset));
             }
             case proto::plan::OpType::Match: {
-                PatternMatchTranslator translator;
-                auto regex_pattern = translator(pattern);
-                return RegexQuery(regex_pattern);
+                return PatternQuery(pattern);
             }
             default:
                 ThrowInfo(ErrorCode::OpTypeInvalid,
-                          "not supported op type: {} for index PatterMatch",
+                          "not supported op type: {} for index PatternMatch",
                           op);
         }
     }
-
-    bool
-    SupportRegexQuery() const override {
-        return std::is_same_v<T, std::string>;
-    }
-
-    const TargetBitmap
-    RegexQuery(const std::string& regex_pattern) override;
 
  public:
     int64_t
@@ -286,30 +326,30 @@ class BitmapIndex : public ScalarIndex<T> {
     ConvertRoaringToBitset(const roaring::Roaring& values);
 
     TargetBitmap
-    RangeForRoaring(T value, OpType op);
+    RangeForRoaring(const T& value, OpType op);
 
     TargetBitmap
-    RangeForBitset(T value, OpType op);
+    RangeForBitset(const T& value, OpType op);
 
     TargetBitmap
-    RangeForMmap(T value, OpType op);
+    RangeForMmap(const T& value, OpType op);
 
     TargetBitmap
-    RangeForRoaring(T lower_bound_value,
+    RangeForRoaring(const T& lower_bound_value,
                     bool lb_inclusive,
-                    T upper_bound_value,
+                    const T& upper_bound_value,
                     bool ub_inclusive);
 
     TargetBitmap
-    RangeForBitset(T lower_bound_value,
+    RangeForBitset(const T& lower_bound_value,
                    bool lb_inclusive,
-                   T upper_bound_value,
+                   const T& upper_bound_value,
                    bool ub_inclusive);
 
     TargetBitmap
-    RangeForMmap(T lower_bound_value,
+    RangeForMmap(const T& lower_bound_value,
                  bool lb_inclusive,
-                 T upper_bound_value,
+                 const T& upper_bound_value,
                  bool ub_inclusive);
 
     void
@@ -340,7 +380,6 @@ class BitmapIndex : public ScalarIndex<T> {
         bitsets_offsets_cache_;
     std::vector<typename std::map<T, roaring::Roaring>::iterator>
         mmap_offsets_cache_;
-    std::shared_ptr<storage::MemFileManagerImpl> file_manager_;
 
     // generate valid_bitset to speed up NotIn and IsNull and IsNotNull operate
     TargetBitmap valid_bitset_;

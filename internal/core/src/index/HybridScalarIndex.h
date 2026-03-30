@@ -121,29 +121,29 @@ class HybridScalarIndex : public ScalarIndex<T> {
     }
 
     bool
-    TryUseRegexQuery() const override {
-        return internal_index_->TryUseRegexQuery();
+    TryUsePatternQuery() const override {
+        return internal_index_->TryUsePatternQuery();
     }
 
     bool
-    SupportRegexQuery() const override {
-        return internal_index_->SupportRegexQuery();
+    SupportPatternQuery() const override {
+        return internal_index_->SupportPatternQuery();
     }
 
     const TargetBitmap
-    RegexQuery(const std::string& pattern) override {
-        return internal_index_->RegexQuery(pattern);
+    PatternQuery(const std::string& pattern) override {
+        return internal_index_->PatternQuery(pattern);
     }
 
     const TargetBitmap
-    Range(T value, OpType op) override {
+    Range(const T& value, OpType op) override {
         return internal_index_->Range(value, op);
     }
 
     const TargetBitmap
-    Range(T lower_bound_value,
+    Range(const T& lower_bound_value,
           bool lb_inclusive,
-          T upper_bound_value,
+          const T& upper_bound_value,
           bool ub_inclusive) override {
         return internal_index_->Range(
             lower_bound_value, lb_inclusive, upper_bound_value, ub_inclusive);
@@ -179,6 +179,13 @@ class HybridScalarIndex : public ScalarIndex<T> {
 
     IndexStatsPtr
     Upload(const Config& config = {}) override;
+
+    void
+    WriteEntries(storage::IndexEntryWriter* writer) override;
+
+    void
+    LoadEntries(storage::IndexEntryReader& reader,
+                const Config& config) override;
 
  private:
     ScalarIndexType
@@ -221,7 +228,6 @@ class HybridScalarIndex : public ScalarIndex<T> {
     ScalarIndexType internal_index_type_;
     std::shared_ptr<ScalarIndex<T>> internal_index_{nullptr};
     storage::FileManagerContext file_manager_context_;
-    std::shared_ptr<storage::MemFileManagerImpl> mem_file_manager_{nullptr};
 
     // `tantivy_index_version_` is used to control which kind of tantivy index should be used.
     // There could be the case where milvus version of read node is lower than the version of index builder node(and read node

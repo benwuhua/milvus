@@ -91,8 +91,21 @@ const (
 
 const (
 	MinimalScalarIndexEngineVersion = int32(0)
+	// TODO: scalar index version 3 is still in development, so we use 2 as the current version.
+	// Do not use version 3 until this TODO is resolved.
 	CurrentScalarIndexEngineVersion = int32(2)
+	MaximumScalarIndexEngineVersion = int32(2)
 )
+
+// ClampScalarIndexVersion clamps the given scalar index version to MaximumScalarIndexEngineVersion.
+// Used by DataNode to ensure the version written back to metadata does not exceed
+// what the cluster can handle.
+func ClampScalarIndexVersion(v int32) int32 {
+	if v > MaximumScalarIndexEngineVersion {
+		return MaximumScalarIndexEngineVersion
+	}
+	return v
+}
 
 const DefaultTimezone = "UTC"
 
@@ -172,6 +185,8 @@ const (
 	JSONCastTypeKey     = "json_cast_type"
 	JSONPathKey         = "json_path"
 	JSONCastFunctionKey = "json_cast_function"
+
+	SchemaVersionConsistencyProportionKey = "schema_version_consistency_proportion"
 )
 
 // expr query params
@@ -251,19 +266,20 @@ const (
 // common properties
 const (
 	MmapEnabledKey             = "mmap.enabled"
-	LazyLoadEnableKey          = "lazyload.enabled" // deprecated by warmup related params
 	LoadPriorityKey            = "load_priority"
 	PartitionKeyIsolationKey   = "partitionkey.isolation"
 	FieldSkipLoadKey           = "field.skipLoad"
 	IndexOffsetCacheEnabledKey = "indexoffsetcache.enabled"
 	IndexNonEncoding           = "index.nonEncoding"
 	EnableDynamicSchemaKey     = `dynamicfield.enabled`
-	NamespaceEnabledKey        = "namespace.enabled"
 
 	// timezone releated
 	TimezoneKey             = "timezone"
 	AllowInsertAutoIDKey    = "allow_insert_auto_id"
 	DisableFuncRuntimeCheck = "disable_func_runtime_check"
+
+	// BigTopK optimization
+	BigTopKOptimizationEnabledKey = "bigtopk_optimization.enabled"
 
 	// warmup related
 	WarmupKey            = "warmup"
@@ -273,6 +289,7 @@ const (
 	WarmupVectorIndexKey = "warmup.vectorIndex"
 	WarmupDisable        = "disable"
 	WarmupSync           = "sync"
+	WarmupAsync          = "async"
 )
 
 const (
@@ -356,8 +373,8 @@ func IsCollectionWarmupKey(key string) bool {
 
 // ValidateWarmupPolicy validates that the warmup policy value is valid
 func ValidateWarmupPolicy(value string) error {
-	if value != WarmupDisable && value != WarmupSync {
-		return fmt.Errorf("invalid warmup policy: %s, must be '%s' or '%s'", value, WarmupDisable, WarmupSync)
+	if value != WarmupDisable && value != WarmupSync && value != WarmupAsync {
+		return fmt.Errorf("invalid warmup policy: %s, must be '%s', '%s' or '%s'", value, WarmupDisable, WarmupSync, WarmupAsync)
 	}
 	return nil
 }
@@ -444,30 +461,25 @@ func FieldHasMmapKey(schema *schemapb.CollectionSchema, fieldID int64) bool {
 	return false
 }
 
-func HasLazyload(props []*commonpb.KeyValuePair) bool {
-	for _, kv := range props {
-		if kv.Key == LazyLoadEnableKey {
-			return true
-		}
-	}
-	return false
-}
-
-func IsCollectionLazyLoadEnabled(kvs ...*commonpb.KeyValuePair) bool {
-	for _, kv := range kvs {
-		if kv.Key == LazyLoadEnableKey && strings.ToLower(kv.Value) == "true" {
-			return true
-		}
-	}
-	return false
-}
-
 func IsPartitionKeyIsolationKvEnabled(kvs ...*commonpb.KeyValuePair) (bool, error) {
 	for _, kv := range kvs {
 		if kv.Key == PartitionKeyIsolationKey {
 			val, err := strconv.ParseBool(strings.ToLower(kv.Value))
 			if err != nil {
 				return false, errors.Wrap(err, "failed to parse partition key isolation")
+			}
+			return val, nil
+		}
+	}
+	return false, nil
+}
+
+func IsBigTopKOptimizationEnabled(kvs ...*commonpb.KeyValuePair) (bool, error) {
+	for _, kv := range kvs {
+		if kv.Key == BigTopKOptimizationEnabledKey {
+			val, err := strconv.ParseBool(strings.ToLower(kv.Value))
+			if err != nil {
+				return false, errors.Wrap(err, "failed to parse bigTopK Optimization")
 			}
 			return val, nil
 		}
@@ -641,19 +653,6 @@ func ValidateAutoIndexMmapConfig(autoIndexConfigEnable, isVectorField bool, inde
 	return nil
 }
 
-func ParseNamespaceProp(props ...*commonpb.KeyValuePair) (value bool, has bool, err error) {
-	for _, p := range props {
-		if p.GetKey() == NamespaceEnabledKey {
-			value, err := strconv.ParseBool(p.GetValue())
-			if err != nil {
-				return false, false, fmt.Errorf("invalid namespace prop value: %s", p.GetValue())
-			}
-			return value, true, nil
-		}
-	}
-	return false, false, nil
-}
-
 func AllocAutoID(allocFunc func(uint32) (int64, int64, error), rowNum uint32, clusterID uint64) (int64, int64, error) {
 	idStart, idEnd, err := allocFunc(rowNum)
 	if err != nil {
@@ -739,10 +738,7 @@ func GetCollectionTTLFromMap(kvs map[string]string) (time.Duration, error) {
 }
 
 func CheckNamespace(schema *schemapb.CollectionSchema, namespace *string) error {
-	enabled, _, err := ParseNamespaceProp(schema.Properties...)
-	if err != nil {
-		return err
-	}
+	enabled := schema.GetEnableNamespace()
 	namespaceIsSet := namespace != nil
 	if enabled != namespaceIsSet {
 		if namespaceIsSet {

@@ -64,16 +64,16 @@ const (
 	RefIndexStateFailed
 )
 
-// SnapshotRefIndex holds segment and index IDs loaded from S3.
+// SnapshotRefIndex holds segment and build IDs loaded from S3.
 // Loading state is managed per-snapshot to support retry on failure.
 //
 // CONCURRENCY: Protected by RWMutex since SetLoaded (async loader) and
-// ContainsSegment/ContainsIndex (GC) may run concurrently.
+// ContainsSegment/ContainsBuildID (GC) may run concurrently.
 type SnapshotRefIndex struct {
 	mu         sync.RWMutex
 	loadState  RefIndexLoadState
 	segmentIDs typeutil.UniqueSet
-	indexIDs   typeutil.UniqueSet
+	buildIDs   typeutil.UniqueSet
 }
 
 // NewSnapshotRefIndex creates a new empty SnapshotRefIndex.
@@ -84,22 +84,22 @@ func NewSnapshotRefIndex() *SnapshotRefIndex {
 
 // NewLoadedSnapshotRefIndex creates a SnapshotRefIndex with pre-loaded data.
 // Used for newly created snapshots where data is already available.
-func NewLoadedSnapshotRefIndex(segmentIDs, indexIDs []int64) *SnapshotRefIndex {
+func NewLoadedSnapshotRefIndex(segmentIDs, buildIDs []int64) *SnapshotRefIndex {
 	return &SnapshotRefIndex{
 		loadState:  RefIndexStateLoaded,
 		segmentIDs: typeutil.NewUniqueSet(segmentIDs...),
-		indexIDs:   typeutil.NewUniqueSet(indexIDs...),
+		buildIDs:   typeutil.NewUniqueSet(buildIDs...),
 	}
 }
 
-// SetLoaded sets the segment and index IDs and marks the RefIndex as loaded.
+// SetLoaded sets the segment and build IDs and marks the RefIndex as loaded.
 // This is called by the async loader after reading data from S3.
-func (r *SnapshotRefIndex) SetLoaded(segmentIDs, indexIDs []int64) {
+func (r *SnapshotRefIndex) SetLoaded(segmentIDs, buildIDs []int64) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.loadState = RefIndexStateLoaded
 	r.segmentIDs = typeutil.NewUniqueSet(segmentIDs...)
-	r.indexIDs = typeutil.NewUniqueSet(indexIDs...)
+	r.buildIDs = typeutil.NewUniqueSet(buildIDs...)
 }
 
 // ContainsSegment checks if segment exists.
@@ -110,12 +110,12 @@ func (r *SnapshotRefIndex) ContainsSegment(segmentID UniqueID) bool {
 	return r.segmentIDs != nil && r.segmentIDs.Contain(segmentID)
 }
 
-// ContainsIndex checks if index exists.
-// Used by GC to check if an index is referenced by this snapshot.
-func (r *SnapshotRefIndex) ContainsIndex(indexID UniqueID) bool {
+// ContainsBuildID checks if build ID exists.
+// Used by GC to check if a specific index build is referenced by this snapshot.
+func (r *SnapshotRefIndex) ContainsBuildID(buildID UniqueID) bool {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
-	return r.indexIDs != nil && r.indexIDs.Contain(indexID)
+	return r.buildIDs != nil && r.buildIDs.Contain(buildID)
 }
 
 // SetFailed marks the RefIndex as failed to load from S3.
@@ -333,7 +333,7 @@ func (sm *snapshotMeta) loadUnloadedRefIndexes() {
 				zap.Error(err))
 			refIndex.SetFailed()
 		} else {
-			refIndex.SetLoaded(snapshotData.SegmentIDs, snapshotData.IndexIDs)
+			refIndex.SetLoaded(snapshotData.SegmentIDs, snapshotData.BuildIDs)
 			log.Info("loaded RefIndex from S3",
 				zap.String("name", info.GetName()),
 				zap.Int64("id", id))
@@ -382,15 +382,20 @@ func (sm *snapshotMeta) SaveSnapshot(ctx context.Context, snapshot *SnapshotData
 		zap.Int64("collectionID", snapshot.SnapshotInfo.GetCollectionId()),
 	)
 
-	// Step 1: Extract segment IDs and index IDs for reference tracking
+	// Step 1: Extract segment IDs and build IDs for reference tracking
+	// Also populate SnapshotData fields so they are persisted to S3 metadata.json.
+	// Without this, after restart the RefIndex loaded from S3 would have nil segmentIDs,
+	// causing GC to skip snapshot protection and delete referenced files.
 	segmentIDs := make([]int64, 0, len(snapshot.Segments))
-	indexIDs := make([]int64, 0, len(snapshot.Indexes))
+	buildIDs := make([]int64, 0)
 	for _, segment := range snapshot.Segments {
 		segmentIDs = append(segmentIDs, segment.GetSegmentId())
+		for _, indexFile := range segment.GetIndexFiles() {
+			buildIDs = append(buildIDs, indexFile.GetBuildID())
+		}
 	}
-	for _, index := range snapshot.Indexes {
-		indexIDs = append(indexIDs, index.GetIndexID())
-	}
+	snapshot.SegmentIDs = segmentIDs
+	snapshot.BuildIDs = buildIDs
 
 	// Step 2: Phase 1 (Prepare) - Save PENDING state to catalog
 	// This enables GC to cleanup orphan S3 files if subsequent steps fail
@@ -421,7 +426,7 @@ func (sm *snapshotMeta) SaveSnapshot(ctx context.Context, snapshot *SnapshotData
 	// Insert into in-memory cache (two maps)
 	sm.snapshotID2Info.Insert(snapshot.SnapshotInfo.GetId(), snapshot.SnapshotInfo)
 	sm.snapshotID2RefIndex.Insert(snapshot.SnapshotInfo.GetId(),
-		NewLoadedSnapshotRefIndex(segmentIDs, indexIDs))
+		NewLoadedSnapshotRefIndex(segmentIDs, buildIDs))
 
 	// Build secondary indexes for O(1) lookup
 	sm.addToSecondaryIndexes(snapshot.SnapshotInfo)
@@ -621,7 +626,7 @@ func (sm *snapshotMeta) GetSnapshot(ctx context.Context, snapshotName string) (*
 //
 // Returns:
 //   - *SnapshotData: Snapshot data (segments only populated when includeSegments=true;
-//     SegmentIDs/IndexIDs always populated for new format snapshots)
+//     SegmentIDs always populated for new format snapshots)
 //   - error: Error if snapshot not found or S3 read fails
 func (sm *snapshotMeta) ReadSnapshotData(ctx context.Context, snapshotName string, includeSegments bool) (*SnapshotData, error) {
 	log := log.Ctx(ctx).With(zap.String("snapshotName", snapshotName))
@@ -685,16 +690,15 @@ func (sm *snapshotMeta) getSnapshotByName(ctx context.Context, snapshotName stri
 // This is used for garbage collection safety: before deleting a segment, check if
 // any snapshots reference it. If snapshots exist, the segment cannot be deleted.
 //
-// IMPORTANT: Caller should check IsRefIndexLoadedForCollection(collectionID) first.
-// If RefIndexes are not loaded, results may be incomplete (returns empty for
-// snapshots whose data is not available), which could lead to unsafe deletions.
+// When collectionID >= 0, only snapshots for that collection are checked.
+// When collectionID < 0, all snapshots across all collections are checked.
 //
-// The lookup is O(N) where N is the number of snapshots. Each ContainsSegment()
-// call is non-blocking and returns false if data is not yet loaded.
+// Caller should check IsAllRefIndexLoaded (when collectionID < 0) or
+// IsRefIndexLoadedForCollection (when collectionID >= 0) first to ensure the result is reliable.
 //
 // Parameters:
 //   - ctx: Context for cancellation (currently unused but reserved for future)
-//   - collectionID: Collection ID to filter snapshots (only check this collection)
+//   - collectionID: Collection ID to filter snapshots, or negative to check all collections
 //   - segmentID: Segment ID to search for in snapshots
 //
 // Returns:
@@ -702,9 +706,8 @@ func (sm *snapshotMeta) getSnapshotByName(ctx context.Context, snapshotName stri
 func (sm *snapshotMeta) GetSnapshotBySegment(ctx context.Context, collectionID, segmentID UniqueID) []UniqueID {
 	snapshotIDs := make([]UniqueID, 0)
 
-	// Scan snapshots and check if segment is in the precomputed ID set
 	sm.snapshotID2Info.Range(func(id UniqueID, info *datapb.SnapshotInfo) bool {
-		if info.GetCollectionId() != collectionID {
+		if collectionID >= 0 && info.GetCollectionId() != collectionID {
 			return true // Skip, different collection
 		}
 
@@ -713,54 +716,10 @@ func (sm *snapshotMeta) GetSnapshotBySegment(ctx context.Context, collectionID, 
 			return true // RefIndex not found (should not happen)
 		}
 
-		// ContainsSegment is non-blocking and returns false if data is not yet loaded
 		if refIndex.ContainsSegment(segmentID) {
 			snapshotIDs = append(snapshotIDs, id)
 		}
-		return true // Continue iteration
-	})
-
-	return snapshotIDs
-}
-
-// GetSnapshotByIndex returns all snapshot IDs that reference a given index.
-//
-// This is used for garbage collection safety: before deleting an index, check if
-// any snapshots reference it. If snapshots exist, the index cannot be deleted.
-//
-// IMPORTANT: Caller should check IsRefIndexLoadedForCollection(collectionID) first.
-// If RefIndexes are not loaded, results may be incomplete (returns empty for
-// snapshots whose data is not available), which could lead to unsafe deletions.
-//
-// The lookup is O(N) where N is the number of snapshots. Each ContainsIndex()
-// call is non-blocking and returns false if data is not yet loaded.
-//
-// Parameters:
-//   - ctx: Context for cancellation (currently unused but reserved for future)
-//   - collectionID: Collection ID to filter snapshots (only check this collection)
-//   - indexID: Index ID to search for in snapshots
-//
-// Returns:
-//   - []UniqueID: List of snapshot IDs that contain this index (empty if none)
-func (sm *snapshotMeta) GetSnapshotByIndex(ctx context.Context, collectionID, indexID UniqueID) []UniqueID {
-	snapshotIDs := make([]UniqueID, 0)
-
-	// Scan snapshots and check if index is in the precomputed ID set
-	sm.snapshotID2Info.Range(func(id UniqueID, info *datapb.SnapshotInfo) bool {
-		if info.GetCollectionId() != collectionID {
-			return true // Skip, different collection
-		}
-
-		refIndex, exists := sm.snapshotID2RefIndex.Get(id)
-		if !exists {
-			return true // RefIndex not found (should not happen)
-		}
-
-		// ContainsIndex is non-blocking and returns false if data is not yet loaded
-		if refIndex.ContainsIndex(indexID) {
-			snapshotIDs = append(snapshotIDs, id)
-		}
-		return true // Continue iteration
+		return true
 	})
 
 	return snapshotIDs
@@ -899,6 +858,48 @@ func (sm *snapshotMeta) removeFromSecondaryIndexes(snapshotInfo *datapb.Snapshot
 	} else {
 		sm.collectionID2Snapshots.Insert(collectionID, snapshotIDs)
 	}
+}
+
+// GetSnapshotByBuildID returns all snapshot IDs that reference a given build ID.
+//
+// This is used for garbage collection safety: before deleting index files for a build,
+// check if any snapshots reference it. If snapshots exist, the files cannot be deleted.
+//
+// BuildID identifies a specific index build task, providing precise file-level protection.
+//
+// Caller should check IsAllRefIndexLoaded or IsRefIndexLoadedForCollection first.
+//
+// Parameters:
+//   - buildID: Build ID to search for in snapshots
+//
+// Returns:
+//   - []UniqueID: List of snapshot IDs that contain this build ID (empty if none)
+func (sm *snapshotMeta) GetSnapshotByBuildID(buildID UniqueID) []UniqueID {
+	snapshotIDs := make([]UniqueID, 0)
+
+	sm.snapshotID2RefIndex.Range(func(id UniqueID, refIndex *SnapshotRefIndex) bool {
+		if refIndex.ContainsBuildID(buildID) {
+			snapshotIDs = append(snapshotIDs, id)
+		}
+		return true
+	})
+
+	return snapshotIDs
+}
+
+// IsAllRefIndexLoaded checks if all RefIndexes across all snapshots are loaded.
+// Used by GC when querying snapshot references without a specific collectionID.
+func (sm *snapshotMeta) IsAllRefIndexLoaded() bool {
+	allLoaded := true
+	sm.snapshotID2Info.Range(func(id UniqueID, info *datapb.SnapshotInfo) bool {
+		refIndex, exists := sm.snapshotID2RefIndex.Get(id)
+		if !exists || !refIndex.IsLoaded() {
+			allLoaded = false
+			return false // Stop iteration
+		}
+		return true
+	})
+	return allLoaded
 }
 
 // IsRefIndexLoadedForCollection checks if RefIndexes for a collection are loaded.

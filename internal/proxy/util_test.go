@@ -2118,19 +2118,41 @@ func Test_NQLimit(t *testing.T) {
 
 func Test_TopKLimit(t *testing.T) {
 	paramtable.Init()
-	assert.Nil(t, validateLimit(16384))
-	assert.Nil(t, validateLimit(1))
-	assert.Error(t, validateLimit(16385))
-	assert.Error(t, validateLimit(0))
+	assert.Nil(t, validateLimit(16384, false))
+	assert.Nil(t, validateLimit(1, false))
+	assert.Error(t, validateLimit(16385, false))
+	assert.Error(t, validateLimit(0, false))
+}
+
+func Test_BigTopKLimit(t *testing.T) {
+	paramtable.Init()
+	Params.Save(Params.QuotaConfig.TopKLimit.Key, "100")
+	Params.Save(Params.QuotaConfig.BigTopKLimit.Key, "200")
+	defer Params.Reset(Params.QuotaConfig.TopKLimit.Key)
+	defer Params.Reset(Params.QuotaConfig.BigTopKLimit.Key)
+
+	assert.Nil(t, validateLimit(100, false))
+	assert.Error(t, validateLimit(101, false))
+
+	assert.Nil(t, validateLimit(200, true))
+	assert.Nil(t, validateLimit(150, true))
+	assert.Error(t, validateLimit(201, true))
+	assert.Error(t, validateLimit(0, true))
 }
 
 func Test_MaxQueryResultWindow(t *testing.T) {
 	paramtable.Init()
-	assert.Nil(t, validateMaxQueryResultWindow(0, 16384))
-	assert.Nil(t, validateMaxQueryResultWindow(0, 1))
-	assert.Error(t, validateMaxQueryResultWindow(0, 16385))
-	assert.Error(t, validateMaxQueryResultWindow(0, 0))
-	assert.Error(t, validateMaxQueryResultWindow(1, 0))
+	assert.Nil(t, validateMaxQueryResultWindow(0, 16384, false))
+	assert.Nil(t, validateMaxQueryResultWindow(0, 1, false))
+	assert.Error(t, validateMaxQueryResultWindow(0, 16385, false))
+	assert.Error(t, validateMaxQueryResultWindow(0, 0, false))
+	assert.Error(t, validateMaxQueryResultWindow(1, 0, false))
+
+	Params.Save(Params.QuotaConfig.BigMaxQueryResultWindow.Key, "1000000")
+	defer Params.Reset(Params.QuotaConfig.BigMaxQueryResultWindow.Key)
+	assert.Nil(t, validateMaxQueryResultWindow(0, 16385, true))
+	assert.Nil(t, validateMaxQueryResultWindow(0, 1000000, true))
+	assert.Error(t, validateMaxQueryResultWindow(0, 1000001, true))
 }
 
 func Test_GetPartitionProgressFailed(t *testing.T) {
@@ -3362,6 +3384,71 @@ func TestComputeRecall(t *testing.T) {
 
 		err := computeRecall(result1, gt)
 		assert.Error(t, err)
+	})
+
+	t.Run("empty result with nil ids", func(t *testing.T) {
+		result := &schemapb.SearchResultData{
+			NumQueries: 2,
+			Topks:      []int64{0, 0},
+		}
+		gt := &schemapb.SearchResultData{
+			NumQueries: 2,
+			Ids: &schemapb.IDs{
+				IdField: &schemapb.IDs_IntId{
+					IntId: &schemapb.LongArray{
+						Data: []int64{1, 2, 3, 4, 5, 6, 7, 8, 9, 10},
+					},
+				},
+			},
+			Scores: []float32{1.0, 0.9, 0.8, 0.7, 0.6, 1.0, 0.9, 0.8, 0.7, 0.6},
+			Topks:  []int64{5, 5},
+		}
+
+		err := computeRecall(result, gt)
+		assert.NoError(t, err)
+		assert.Equal(t, 2, len(result.Recalls))
+		assert.Equal(t, float32(0), result.Recalls[0])
+		assert.Equal(t, float32(0), result.Recalls[1])
+	})
+
+	t.Run("empty gt with nil ids", func(t *testing.T) {
+		result := &schemapb.SearchResultData{
+			NumQueries: 1,
+			Ids: &schemapb.IDs{
+				IdField: &schemapb.IDs_IntId{
+					IntId: &schemapb.LongArray{
+						Data: []int64{1, 2, 3},
+					},
+				},
+			},
+			Scores: []float32{1.0, 0.9, 0.8},
+			Topks:  []int64{3},
+		}
+		gt := &schemapb.SearchResultData{
+			NumQueries: 1,
+			Topks:      []int64{0},
+		}
+
+		err := computeRecall(result, gt)
+		assert.NoError(t, err)
+		assert.Equal(t, 1, len(result.Recalls))
+		assert.Equal(t, float32(0), result.Recalls[0])
+	})
+
+	t.Run("both empty results", func(t *testing.T) {
+		result := &schemapb.SearchResultData{
+			NumQueries: 1,
+			Topks:      []int64{0},
+		}
+		gt := &schemapb.SearchResultData{
+			NumQueries: 1,
+			Topks:      []int64{0},
+		}
+
+		err := computeRecall(result, gt)
+		assert.NoError(t, err)
+		assert.Equal(t, 1, len(result.Recalls))
+		assert.Equal(t, float32(0), result.Recalls[0])
 	})
 }
 

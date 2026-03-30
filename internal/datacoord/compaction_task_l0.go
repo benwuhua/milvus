@@ -327,6 +327,7 @@ func (t *l0CompactionTask) selectFlushedSegment() ([]*SegmentInfo, []*datapb.Com
 			CollectionID:        info.GetCollectionID(),
 			PartitionID:         info.GetPartitionID(),
 			IsSorted:            info.GetIsSorted(),
+			IsSortedByNamespace: info.GetIsSortedByNamespace(),
 			Manifest:            info.GetManifestPath(),
 		})
 	}
@@ -360,14 +361,15 @@ func (t *l0CompactionTask) BuildCompactionRequest() (*datapb.CompactionPlan, err
 			return nil, merr.WrapErrSegmentNotFound(segID)
 		}
 		plan.SegmentBinlogs = append(plan.SegmentBinlogs, &datapb.CompactionSegmentBinlogs{
-			SegmentID:     segID,
-			CollectionID:  segInfo.GetCollectionID(),
-			PartitionID:   segInfo.GetPartitionID(),
-			Level:         segInfo.GetLevel(),
-			InsertChannel: segInfo.GetInsertChannel(),
-			Deltalogs:     segInfo.GetDeltalogs(),
-			IsSorted:      segInfo.GetIsSorted(),
-			Manifest:      segInfo.GetManifestPath(),
+			SegmentID:           segID,
+			CollectionID:        segInfo.GetCollectionID(),
+			PartitionID:         segInfo.GetPartitionID(),
+			Level:               segInfo.GetLevel(),
+			InsertChannel:       segInfo.GetInsertChannel(),
+			Deltalogs:           segInfo.GetDeltalogs(),
+			IsSorted:            segInfo.GetIsSorted(),
+			IsSortedByNamespace: segInfo.GetIsSortedByNamespace(),
+			Manifest:            segInfo.GetManifestPath(),
 		})
 		segments = append(segments, segInfo)
 	}
@@ -445,7 +447,13 @@ func (t *l0CompactionTask) saveTaskMeta(task *datapb.CompactionTask) error {
 func (t *l0CompactionTask) saveSegmentMeta(outputSegs []*datapb.CompactionSegment) error {
 	var operators []UpdateOperator
 	for _, seg := range outputSegs {
-		operators = append(operators, AddBinlogsOperator(seg.GetSegmentID(), nil, nil, seg.GetDeltalogs(), nil))
+		if seg.GetManifest() != "" {
+			// V2: Update manifest path (deltalog is inside manifest)
+			operators = append(operators, UpdateManifest(seg.GetSegmentID(), seg.GetManifest()))
+		} else {
+			// V1: Add deltalogs directly
+			operators = append(operators, AddBinlogsOperator(seg.GetSegmentID(), nil, nil, seg.GetDeltalogs(), nil))
+		}
 	}
 
 	for _, segID := range t.GetTaskProto().InputSegments {

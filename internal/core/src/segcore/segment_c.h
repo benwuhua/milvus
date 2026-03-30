@@ -142,7 +142,8 @@ AsyncSearch(CTraceContext c_trace,
             CPlaceholderGroup c_placeholder_group,
             uint64_t timestamp,
             int32_t consistency_level,
-            uint64_t collection_ttl);
+            uint64_t collection_ttl,
+            uint64_t entity_ttl_physical_time_us);
 
 void
 DeleteRetrieveResult(CRetrieveResult* retrieve_result);
@@ -155,7 +156,8 @@ AsyncRetrieve(CTraceContext c_trace,
               int64_t limit_size,
               bool ignore_non_pk,
               int32_t consistency_level,
-              uint64_t collection_ttl);
+              uint64_t collection_ttl,
+              uint64_t entity_ttl_physical_time_us);
 
 CFuture*  // Future<CRetrieveResult>
 AsyncRetrieveByOffsets(CTraceContext c_trace,
@@ -209,12 +211,6 @@ UpdateSealedSegmentIndex(CSegmentInterface c_segment,
                          CLoadIndexInfo c_load_index_info);
 
 CStatus
-LoadTextIndex(CSegmentInterface c_segment,
-              const uint8_t* serialized_load_text_index_info,
-              const uint64_t len,
-              CLoadCancellationSource source);
-
-CStatus
 LoadJsonKeyIndex(CTraceContext c_trace,
                  CSegmentInterface c_segment,
                  const uint8_t* serialied_load_json_key_index_info,
@@ -240,10 +236,6 @@ DropSealedSegmentJSONIndex(CSegmentInterface c_segment,
                            int64_t field_id,
                            const char* nested_path);
 
-CStatus
-AddFieldDataInfoForSealed(CSegmentInterface c_segment,
-                          CLoadFieldDataInfo c_load_field_data_info);
-
 //////////////////////////////    interfaces for SegmentInterface    //////////////////////////////
 CStatus
 ExistPk(CSegmentInterface c_segment,
@@ -260,11 +252,6 @@ Delete(CSegmentInterface c_segment,
 
 void
 RemoveFieldFile(CSegmentInterface c_segment, int64_t field_id);
-
-CStatus
-CreateTextIndex(CSegmentInterface c_segment,
-                int64_t field_id,
-                CLoadCancellationSource source);
 
 CStatus
 ExprResCacheEraseSegment(int64_t segment_id);

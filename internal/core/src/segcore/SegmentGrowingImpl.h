@@ -358,7 +358,7 @@ class SegmentGrowingImpl : public SegmentGrowing {
     virtual void
     BulkGetJsonData(milvus::OpContext* op_ctx,
                     FieldId field_id,
-                    std::function<void(milvus::Json, size_t, bool)> fn,
+                    const std::function<void(milvus::Json, size_t, bool)>& fn,
                     const int64_t* offsets,
                     int64_t count) const override;
 
@@ -387,8 +387,8 @@ class SegmentGrowingImpl : public SegmentGrowing {
               &insert_record_,
               [this](const std::vector<PkType>& pks,
                      const Timestamp* timestamps,
-                     std::function<void(const SegOffset offset,
-                                        const Timestamp ts)> callback) {
+                     const std::function<void(const SegOffset offset,
+                                              const Timestamp ts)>& callback) {
                   this->search_batch_pks(pks, timestamps, false, callback);
               },
               segment_id) {
@@ -521,8 +521,16 @@ class SegmentGrowingImpl : public SegmentGrowing {
     }
 
     std::pair<std::vector<OffsetMap::OffsetType>, bool>
-    find_first(int64_t limit, const BitsetTypeView& bitset) const override {
-        return insert_record_.pk2offset_->find_first(limit, bitset);
+    find_first_n(int64_t limit, const BitsetTypeView& bitset) const override {
+        return insert_record_.pk2offset_->find_first_n(limit, bitset);
+    }
+
+    std::tuple<std::vector<int64_t>, std::vector<std::vector<int32_t>>, bool>
+    find_first_n_element(int64_t limit,
+                         const BitsetTypeView& element_bitset,
+                         const IArrayOffsets* array_offsets) const override {
+        return insert_record_.pk2offset_->find_first_n_element(
+            limit, element_bitset, array_offsets);
     }
 
     bool

@@ -913,6 +913,13 @@ func TestSearchTask_PreExecute(t *testing.T) {
 		assert.NoError(t, st.PreExecute(ctx))
 		assert.NotNil(t, st.functionScore)
 		assert.Equal(t, false, st.SearchRequest.GetIsAdvanced())
+
+		// Verify EntityTtlPhysicalTime is set (issue #47413)
+		assert.NotZero(t, st.SearchRequest.GetEntityTtlPhysicalTime(),
+			"EntityTtlPhysicalTime should be set from GuaranteeTimestamp")
+		expectedPhysicalMs, _ := tsoutil.ParseHybridTs(st.SearchRequest.GetGuaranteeTimestamp())
+		assert.Equal(t, uint64(expectedPhysicalMs*1000), st.SearchRequest.GetEntityTtlPhysicalTime(),
+			"EntityTtlPhysicalTime should equal physical time in microseconds")
 	})
 
 	t.Run("advance search with rerank", func(t *testing.T) {
@@ -2554,8 +2561,8 @@ func TestTaskSearch_reduceGroupBySearchResultData(t *testing.T) {
 		{
 			name: "nullable group_by values",
 			inputs: []*schemapb.SearchResultData{
-				makePartialResult(ids[0], scores[0], []int64{1, 2, 3, 4, 1, 2, 3, 4}, []bool{true, true, true, true, false, true, true, true, true, false}),
-				makePartialResult(ids[1], scores[1], []int64{1, 2, 3, 4, 1, 2, 3, 4}, []bool{true, true, true, true, false, true, true, true, true, false}),
+				makePartialResult(ids[0], scores[0], []int64{1, 2, 3, 4, 0, 1, 2, 3, 4, 0}, []bool{true, true, true, true, false, true, true, true, true, false}),
+				makePartialResult(ids[1], scores[1], []int64{1, 2, 3, 4, 0, 1, 2, 3, 4, 0}, []bool{true, true, true, true, false, true, true, true, true, false}),
 			},
 			expectedIDs:    []int64{1, 3, 5, 7, 9, 1, 3, 5, 7, 9},
 			expectedScores: []float32{-10, -8, -6, -4, -2, -10, -8, -6, -4, -2},
@@ -3114,7 +3121,7 @@ func TestSearchTask_parseSearchInfo(t *testing.T) {
 
 		for _, test := range tests {
 			t.Run(test.description, func(t *testing.T) {
-				searchInfo, err := parseSearchInfo(test.validParams, nil, nil)
+				searchInfo, err := parseSearchInfo(test.validParams, nil, nil, false)
 				assert.NoError(t, err)
 				assert.NotNil(t, searchInfo.planInfo)
 				if test.description == "offsetParam" {
@@ -3135,7 +3142,7 @@ func TestSearchTask_parseSearchInfo(t *testing.T) {
 			limit: externalLimit,
 		}
 
-		searchInfo, err := parseSearchInfo(offsetParam, nil, rank)
+		searchInfo, err := parseSearchInfo(offsetParam, nil, rank, false)
 		assert.NoError(t, err)
 		assert.NotNil(t, searchInfo.planInfo)
 		assert.Equal(t, int64(10), searchInfo.planInfo.GetTopk())
@@ -3169,7 +3176,7 @@ func TestSearchTask_parseSearchInfo(t *testing.T) {
 			Key:   LimitKey,
 			Value: "100",
 		})
-		testRankParams, err := parseRankParams(testRankParamsPairs, schema)
+		testRankParams, err := parseRankParams(testRankParamsPairs, schema, false)
 		assert.NoError(t, err)
 
 		// 2. parse search params for sub request in hybridsearch
@@ -3188,7 +3195,7 @@ func TestSearchTask_parseSearchInfo(t *testing.T) {
 			Value: "true",
 		})
 
-		searchInfo, err := parseSearchInfo(params, schema, testRankParams)
+		searchInfo, err := parseSearchInfo(params, schema, testRankParams, false)
 		assert.NoError(t, err)
 		assert.NotNil(t, searchInfo.planInfo)
 
@@ -3278,7 +3285,7 @@ func TestSearchTask_parseSearchInfo(t *testing.T) {
 
 		for _, test := range tests {
 			t.Run(test.description, func(t *testing.T) {
-				searchInfo, err := parseSearchInfo(test.invalidParams, nil, nil)
+				searchInfo, err := parseSearchInfo(test.invalidParams, nil, nil, false)
 				assert.Error(t, err)
 				assert.Nil(t, searchInfo)
 
@@ -3304,7 +3311,7 @@ func TestSearchTask_parseSearchInfo(t *testing.T) {
 		schema := &schemapb.CollectionSchema{
 			Fields: fields,
 		}
-		searchInfo, err := parseSearchInfo(normalParam, schema, nil)
+		searchInfo, err := parseSearchInfo(normalParam, schema, nil, false)
 		assert.Nil(t, searchInfo)
 		assert.ErrorIs(t, err, merr.ErrParameterInvalid)
 	})
@@ -3323,7 +3330,7 @@ func TestSearchTask_parseSearchInfo(t *testing.T) {
 		schema := &schemapb.CollectionSchema{
 			Fields: fields,
 		}
-		searchInfo, err := parseSearchInfo(normalParam, schema, nil)
+		searchInfo, err := parseSearchInfo(normalParam, schema, nil, false)
 		assert.Nil(t, searchInfo)
 		assert.ErrorIs(t, err, merr.ErrParameterInvalid)
 	})
@@ -3342,7 +3349,7 @@ func TestSearchTask_parseSearchInfo(t *testing.T) {
 		schema := &schemapb.CollectionSchema{
 			Fields: fields,
 		}
-		searchInfo, err := parseSearchInfo(normalParam, schema, nil)
+		searchInfo, err := parseSearchInfo(normalParam, schema, nil, false)
 		assert.NotNil(t, searchInfo)
 		assert.NoError(t, err)
 	})
@@ -3361,10 +3368,49 @@ func TestSearchTask_parseSearchInfo(t *testing.T) {
 		schema := &schemapb.CollectionSchema{
 			Fields: fields,
 		}
-		searchInfo, err := parseSearchInfo(normalParam, schema, nil)
+		searchInfo, err := parseSearchInfo(normalParam, schema, nil, false)
 		assert.NotNil(t, searchInfo)
 		assert.NoError(t, err)
 		assert.Equal(t, Params.QuotaConfig.TopKLimit.GetAsInt64(), searchInfo.planInfo.GetTopk())
+	})
+
+	t.Run("check bigTopK uses dedicated topK limit", func(t *testing.T) {
+		Params.Save(Params.QuotaConfig.TopKLimit.Key, "100")
+		Params.Save(Params.QuotaConfig.BigTopKLimit.Key, "200")
+		defer Params.Reset(Params.QuotaConfig.TopKLimit.Key)
+		defer Params.Reset(Params.QuotaConfig.BigTopKLimit.Key)
+
+		param := getValidSearchParams()
+		resetSearchParamsValue(param, TopKKey, `150`)
+
+		_, err := parseSearchInfo(param, nil, nil, false)
+		assert.Error(t, err)
+
+		searchInfo, err := parseSearchInfo(param, nil, nil, true)
+		assert.NoError(t, err)
+		assert.Equal(t, int64(150), searchInfo.planInfo.GetTopk())
+	})
+
+	t.Run("check iterator uses bigTopK limit fallback", func(t *testing.T) {
+		Params.Save(Params.QuotaConfig.TopKLimit.Key, "100")
+		Params.Save(Params.QuotaConfig.BigTopKLimit.Key, "200")
+		defer Params.Reset(Params.QuotaConfig.TopKLimit.Key)
+		defer Params.Reset(Params.QuotaConfig.BigTopKLimit.Key)
+
+		param := getValidSearchParams()
+		param = append(param, &commonpb.KeyValuePair{
+			Key:   IteratorField,
+			Value: "True",
+		})
+		resetSearchParamsValue(param, TopKKey, `250`)
+
+		searchInfo, err := parseSearchInfo(param, nil, nil, false)
+		assert.NoError(t, err)
+		assert.Equal(t, int64(100), searchInfo.planInfo.GetTopk())
+
+		searchInfo, err = parseSearchInfo(param, nil, nil, true)
+		assert.NoError(t, err)
+		assert.Equal(t, int64(200), searchInfo.planInfo.GetTopk())
 	})
 
 	t.Run("check correctness of group size", func(t *testing.T) {
@@ -3381,24 +3427,24 @@ func TestSearchTask_parseSearchInfo(t *testing.T) {
 		schema := &schemapb.CollectionSchema{
 			Fields: fields,
 		}
-		_, err := parseSearchInfo(normalParam, schema, nil)
+		_, err := parseSearchInfo(normalParam, schema, nil, false)
 		assert.Error(t, err)
 		assert.True(t, strings.Contains(err.Error(), "exceeds configured max group size"))
 		{
 			resetSearchParamsValue(normalParam, GroupSizeKey, `10`)
-			searchInfo, err := parseSearchInfo(normalParam, schema, nil)
+			searchInfo, err := parseSearchInfo(normalParam, schema, nil, false)
 			assert.NoError(t, err)
 			assert.Equal(t, int64(10), searchInfo.planInfo.GroupSize)
 		}
 		{
 			resetSearchParamsValue(normalParam, GroupSizeKey, `-1`)
-			_, err := parseSearchInfo(normalParam, schema, nil)
+			_, err := parseSearchInfo(normalParam, schema, nil, false)
 			assert.Error(t, err)
 			assert.True(t, strings.Contains(err.Error(), "is negative"))
 		}
 		{
 			resetSearchParamsValue(normalParam, GroupSizeKey, `xxx`)
-			_, err := parseSearchInfo(normalParam, schema, nil)
+			_, err := parseSearchInfo(normalParam, schema, nil, false)
 			assert.Error(t, err)
 			assert.True(t, strings.Contains(err.Error(), "failed to parse input group size"))
 		}
@@ -3426,7 +3472,7 @@ func TestSearchTask_parseSearchInfo(t *testing.T) {
 
 		t.Run("iteratorV2 normal", func(t *testing.T) {
 			param := generateValidParamsForSearchIteratorV2()
-			searchInfo, err := parseSearchInfo(param, nil, nil)
+			searchInfo, err := parseSearchInfo(param, nil, nil, false)
 			assert.NoError(t, err)
 			assert.NotNil(t, searchInfo.planInfo)
 			assert.NotEmpty(t, searchInfo.planInfo.SearchIteratorV2Info.Token)
@@ -3438,7 +3484,7 @@ func TestSearchTask_parseSearchInfo(t *testing.T) {
 		t.Run("iteratorV2 without isIterator", func(t *testing.T) {
 			param := generateValidParamsForSearchIteratorV2()
 			resetSearchParamsValue(param, IteratorField, "False")
-			_, err := parseSearchInfo(param, nil, nil)
+			_, err := parseSearchInfo(param, nil, nil, false)
 			assert.Error(t, err)
 			assert.ErrorContains(t, err, "both")
 		})
@@ -3457,7 +3503,7 @@ func TestSearchTask_parseSearchInfo(t *testing.T) {
 			schema := &schemapb.CollectionSchema{
 				Fields: fields,
 			}
-			_, err := parseSearchInfo(param, schema, nil)
+			_, err := parseSearchInfo(param, schema, nil, false)
 			assert.Error(t, err)
 			assert.ErrorContains(t, err, "roupBy")
 		})
@@ -3468,7 +3514,7 @@ func TestSearchTask_parseSearchInfo(t *testing.T) {
 				Key:   OffsetKey,
 				Value: "10",
 			})
-			_, err := parseSearchInfo(param, nil, nil)
+			_, err := parseSearchInfo(param, nil, nil, false)
 			assert.Error(t, err)
 			assert.ErrorContains(t, err, "offset")
 		})
@@ -3479,7 +3525,7 @@ func TestSearchTask_parseSearchInfo(t *testing.T) {
 				Key:   SearchIterIdKey,
 				Value: "invalid_token",
 			})
-			_, err := parseSearchInfo(param, nil, nil)
+			_, err := parseSearchInfo(param, nil, nil, false)
 			assert.Error(t, err)
 			assert.ErrorContains(t, err, "invalid token format")
 		})
@@ -3492,7 +3538,7 @@ func TestSearchTask_parseSearchInfo(t *testing.T) {
 				Key:   SearchIterIdKey,
 				Value: token.String(),
 			})
-			searchInfo, err := parseSearchInfo(param, nil, nil)
+			searchInfo, err := parseSearchInfo(param, nil, nil, false)
 			assert.NoError(t, err)
 			assert.NotEmpty(t, searchInfo.planInfo.SearchIteratorV2Info.Token)
 			assert.Equal(t, token.String(), searchInfo.planInfo.SearchIteratorV2Info.Token)
@@ -3501,7 +3547,7 @@ func TestSearchTask_parseSearchInfo(t *testing.T) {
 		t.Run("iteratorV2 batch size", func(t *testing.T) {
 			param := generateValidParamsForSearchIteratorV2()
 			resetSearchParamsValue(param, SearchIterBatchSizeKey, "1.123")
-			_, err := parseSearchInfo(param, nil, nil)
+			_, err := parseSearchInfo(param, nil, nil, false)
 			assert.Error(t, err)
 			assert.ErrorContains(t, err, "batch size is invalid")
 		})
@@ -3509,7 +3555,7 @@ func TestSearchTask_parseSearchInfo(t *testing.T) {
 		t.Run("iteratorV2 batch size", func(t *testing.T) {
 			param := generateValidParamsForSearchIteratorV2()
 			resetSearchParamsValue(param, SearchIterBatchSizeKey, "")
-			_, err := parseSearchInfo(param, nil, nil)
+			_, err := parseSearchInfo(param, nil, nil, false)
 			assert.Error(t, err)
 			assert.ErrorContains(t, err, "batch size is required")
 		})
@@ -3517,7 +3563,7 @@ func TestSearchTask_parseSearchInfo(t *testing.T) {
 		t.Run("iteratorV2 batch size negative", func(t *testing.T) {
 			param := generateValidParamsForSearchIteratorV2()
 			resetSearchParamsValue(param, SearchIterBatchSizeKey, "-1")
-			_, err := parseSearchInfo(param, nil, nil)
+			_, err := parseSearchInfo(param, nil, nil, false)
 			assert.Error(t, err)
 			assert.ErrorContains(t, err, "batch size is invalid")
 		})
@@ -3525,9 +3571,28 @@ func TestSearchTask_parseSearchInfo(t *testing.T) {
 		t.Run("iteratorV2 batch size too large", func(t *testing.T) {
 			param := generateValidParamsForSearchIteratorV2()
 			resetSearchParamsValue(param, SearchIterBatchSizeKey, fmt.Sprintf("%d", Params.QuotaConfig.TopKLimit.GetAsInt64()+1))
-			_, err := parseSearchInfo(param, nil, nil)
+			_, err := parseSearchInfo(param, nil, nil, false)
 			assert.Error(t, err)
 			assert.ErrorContains(t, err, "batch size is invalid")
+		})
+
+		t.Run("iteratorV2 batch size uses bigTopK limit", func(t *testing.T) {
+			Params.Save(Params.QuotaConfig.TopKLimit.Key, "100")
+			Params.Save(Params.QuotaConfig.BigTopKLimit.Key, "200")
+			defer Params.Reset(Params.QuotaConfig.TopKLimit.Key)
+			defer Params.Reset(Params.QuotaConfig.BigTopKLimit.Key)
+
+			param := generateValidParamsForSearchIteratorV2()
+			resetSearchParamsValue(param, SearchIterBatchSizeKey, "150")
+
+			_, err := parseSearchInfo(param, nil, nil, false)
+			assert.Error(t, err)
+			assert.ErrorContains(t, err, "batch size is invalid")
+
+			searchInfo, err := parseSearchInfo(param, nil, nil, true)
+			assert.NoError(t, err)
+			assert.Equal(t, uint32(150), searchInfo.planInfo.SearchIteratorV2Info.BatchSize)
+			assert.Equal(t, int64(150), searchInfo.planInfo.GetTopk())
 		})
 
 		t.Run("iteratorV2 last bound", func(t *testing.T) {
@@ -3537,7 +3602,7 @@ func TestSearchTask_parseSearchInfo(t *testing.T) {
 				Key:   SearchIterLastBoundKey,
 				Value: fmt.Sprintf("%f", kLastBound),
 			})
-			searchInfo, err := parseSearchInfo(param, nil, nil)
+			searchInfo, err := parseSearchInfo(param, nil, nil, false)
 			assert.NoError(t, err)
 			assert.NotNil(t, searchInfo.planInfo)
 			assert.Equal(t, kLastBound, *searchInfo.planInfo.SearchIteratorV2Info.LastBound)
@@ -3549,7 +3614,7 @@ func TestSearchTask_parseSearchInfo(t *testing.T) {
 				Key:   SearchIterLastBoundKey,
 				Value: "xxx",
 			})
-			_, err := parseSearchInfo(param, nil, nil)
+			_, err := parseSearchInfo(param, nil, nil, false)
 			assert.Error(t, err)
 			assert.ErrorContains(t, err, "failed to parse input last bound")
 		})
@@ -3637,7 +3702,7 @@ func TestSearchTask_parseSearchInfo(t *testing.T) {
 			// Add radius parameter for range search
 			resetSearchParamsValue(params, ParamsKey, `{"nprobe": 10, "radius": 0.2}`)
 
-			searchInfo, err := parseSearchInfo(params, schema, nil)
+			searchInfo, err := parseSearchInfo(params, schema, nil, false)
 			assert.Error(t, err)
 			assert.Nil(t, searchInfo)
 			assert.ErrorIs(t, err, merr.ErrParameterInvalid)
@@ -3655,7 +3720,7 @@ func TestSearchTask_parseSearchInfo(t *testing.T) {
 				Value: "group_field",
 			})
 
-			searchInfo, err := parseSearchInfo(params, schema, nil)
+			searchInfo, err := parseSearchInfo(params, schema, nil, false)
 			assert.Error(t, err)
 			assert.Nil(t, searchInfo)
 			assert.ErrorIs(t, err, merr.ErrParameterInvalid)
@@ -3673,7 +3738,7 @@ func TestSearchTask_parseSearchInfo(t *testing.T) {
 				Value: "True",
 			})
 
-			searchInfo, err := parseSearchInfo(params, schema, nil)
+			searchInfo, err := parseSearchInfo(params, schema, nil, false)
 			assert.Error(t, err)
 			assert.Nil(t, searchInfo)
 			assert.ErrorIs(t, err, merr.ErrParameterInvalid)
@@ -3701,7 +3766,7 @@ func TestSearchTask_parseSearchInfo(t *testing.T) {
 				},
 			)
 
-			searchInfo, err := parseSearchInfo(params, schema, nil)
+			searchInfo, err := parseSearchInfo(params, schema, nil, false)
 			assert.Error(t, err)
 			assert.Nil(t, searchInfo)
 			assert.ErrorIs(t, err, merr.ErrParameterInvalid)
@@ -3713,7 +3778,7 @@ func TestSearchTask_parseSearchInfo(t *testing.T) {
 			schema := createSchemaWithVectorArray("embeddings_list")
 			params := createSearchParams("embeddings_list")
 
-			searchInfo, err := parseSearchInfo(params, schema, nil)
+			searchInfo, err := parseSearchInfo(params, schema, nil, false)
 			assert.NoError(t, err)
 			assert.NotNil(t, searchInfo)
 			assert.NotNil(t, searchInfo.planInfo)
@@ -3726,7 +3791,7 @@ func TestSearchTask_parseSearchInfo(t *testing.T) {
 			// Add radius parameter for range search
 			resetSearchParamsValue(params, ParamsKey, `{"nprobe": 10, "radius": 0.2}`)
 
-			searchInfo, err := parseSearchInfo(params, schema, nil)
+			searchInfo, err := parseSearchInfo(params, schema, nil, false)
 			assert.NoError(t, err)
 			assert.NotNil(t, searchInfo)
 			assert.NotNil(t, searchInfo.planInfo)
@@ -3742,7 +3807,7 @@ func TestSearchTask_parseSearchInfo(t *testing.T) {
 				Value: "group_field",
 			})
 
-			searchInfo, err := parseSearchInfo(params, schema, nil)
+			searchInfo, err := parseSearchInfo(params, schema, nil, false)
 			assert.NoError(t, err)
 			assert.NotNil(t, searchInfo)
 			assert.NotNil(t, searchInfo.planInfo)
@@ -3759,7 +3824,7 @@ func TestSearchTask_parseSearchInfo(t *testing.T) {
 				Value: "True",
 			})
 
-			searchInfo, err := parseSearchInfo(params, schema, nil)
+			searchInfo, err := parseSearchInfo(params, schema, nil, false)
 			assert.NoError(t, err)
 			assert.NotNil(t, searchInfo)
 			assert.NotNil(t, searchInfo.planInfo)
@@ -3770,7 +3835,7 @@ func TestSearchTask_parseSearchInfo(t *testing.T) {
 			params := createSearchParams("embeddings_list")
 			resetSearchParamsValue(params, ParamsKey, `{"nprobe": 10, "radius": 0.2}`)
 
-			searchInfo, err := parseSearchInfo(params, schema, nil)
+			searchInfo, err := parseSearchInfo(params, schema, nil, false)
 			assert.Error(t, err)
 			assert.Nil(t, searchInfo)
 			// Should fail on range search first
@@ -3782,7 +3847,7 @@ func TestSearchTask_parseSearchInfo(t *testing.T) {
 			params := getValidSearchParams()
 			// Don't specify anns field
 
-			searchInfo, err := parseSearchInfo(params, schema, nil)
+			searchInfo, err := parseSearchInfo(params, schema, nil, false)
 			assert.NoError(t, err)
 			assert.NotNil(t, searchInfo)
 			// Should not trigger vector array validation without anns field
@@ -3792,7 +3857,7 @@ func TestSearchTask_parseSearchInfo(t *testing.T) {
 			schema := createSchemaWithVectorArray("embeddings_list")
 			params := createSearchParams("non_existent_field")
 
-			searchInfo, err := parseSearchInfo(params, schema, nil)
+			searchInfo, err := parseSearchInfo(params, schema, nil, false)
 			assert.NoError(t, err)
 			assert.NotNil(t, searchInfo)
 			// Should not trigger vector array validation for non-existent field
@@ -3814,12 +3879,12 @@ func TestSearchTask_parseSearchInfo(t *testing.T) {
 				},
 			)
 
-			parsedRankParams, err := parseRankParams(rankParams, schema)
+			parsedRankParams, err := parseRankParams(rankParams, schema, false)
 			assert.NoError(t, err)
 
 			searchParams := createSearchParams("embeddings_list")
 			// Parse search info with rank params
-			searchInfo, err := parseSearchInfo(searchParams, schema, parsedRankParams)
+			searchInfo, err := parseSearchInfo(searchParams, schema, parsedRankParams, false)
 			assert.Error(t, err)
 			assert.Nil(t, searchInfo)
 			assert.ErrorIs(t, err, merr.ErrParameterInvalid)
@@ -3863,7 +3928,7 @@ func TestSearchTask_parseSearchInfo(t *testing.T) {
 			Value: "true",
 		})
 
-		searchInfo, err := parseSearchInfo(params, schema, nil)
+		searchInfo, err := parseSearchInfo(params, schema, nil, false)
 		assert.NoError(t, err)
 		assert.NotNil(t, searchInfo.planInfo)
 
@@ -3898,7 +3963,7 @@ func TestSearchTask_parseSearchInfo(t *testing.T) {
 			Value: "3",
 		})
 
-		searchInfo, err := parseSearchInfo(params, schema, nil)
+		searchInfo, err := parseSearchInfo(params, schema, nil, false)
 		assert.NoError(t, err)
 		assert.NotNil(t, searchInfo.planInfo)
 
@@ -3933,7 +3998,7 @@ func TestSearchTask_parseSearchInfo(t *testing.T) {
 			Value: "invalid_type",
 		})
 
-		searchInfo, err := parseSearchInfo(params, schema, nil)
+		searchInfo, err := parseSearchInfo(params, schema, nil, false)
 		assert.NoError(t, err) // Should not error, just use default value
 		assert.NotNil(t, searchInfo.planInfo)
 
@@ -3961,7 +4026,7 @@ func TestSearchTask_parseSearchInfo(t *testing.T) {
 			Value: "invalid_bool",
 		})
 
-		searchInfo, err := parseSearchInfo(params, schema, nil)
+		searchInfo, err := parseSearchInfo(params, schema, nil, false)
 		assert.NoError(t, err) // Should not error, just use default value
 		assert.NotNil(t, searchInfo.planInfo)
 
@@ -4006,7 +4071,7 @@ func TestSearchTask_parseSearchInfo(t *testing.T) {
 					Value: tc.jsonTypeStr,
 				})
 
-				searchInfo, err := parseSearchInfo(params, schema, nil)
+				searchInfo, err := parseSearchInfo(params, schema, nil, false)
 				assert.NoError(t, err)
 				assert.NotNil(t, searchInfo.planInfo)
 

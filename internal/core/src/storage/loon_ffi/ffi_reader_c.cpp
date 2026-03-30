@@ -139,7 +139,7 @@ NewPackedFFIReaderWithManifest(const LoonManifest* loon_manifest,
             MakeInternalPropertiesFromStorageConfig(c_storage_config);
         auto column_groups =
             std::make_shared<milvus_storage::api::ColumnGroups>();
-        auto status = milvus_storage::import_column_groups(
+        auto status = milvus_storage::column_groups_import(
             &loon_manifest->column_groups, column_groups.get());
         AssertInfo(status.ok(),
                    "Failed to import column groups: {}",
@@ -192,8 +192,12 @@ CloseFFIReader(CFFIPackedReader c_packed_reader) {
     SCOPE_CGO_CALL_METRIC();
 
     try {
+        if (c_packed_reader == nullptr) {
+            return milvus::SuccessCStatus();
+        }
         auto reader =
             static_cast<milvus_storage::api::Reader*>(c_packed_reader);
+        AssertInfo(reader, "cannot close nullptr ffi reader");
         delete reader;
         return milvus::SuccessCStatus();
     } catch (std::exception& e) {

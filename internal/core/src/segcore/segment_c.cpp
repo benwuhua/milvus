@@ -263,7 +263,8 @@ AsyncSearch(CTraceContext c_trace,
             CPlaceholderGroup c_placeholder_group,
             uint64_t timestamp,
             int32_t consistency_level,
-            uint64_t collection_ttl) {
+            uint64_t collection_ttl,
+            uint64_t entity_ttl_physical_time_us) {
     auto segment = static_cast<milvus::segcore::SegmentInterface*>(c_segment);
     auto plan = static_cast<milvus::query::Plan*>(c_plan);
     auto phg_ptr = reinterpret_cast<const milvus::query::PlaceholderGroup*>(
@@ -278,7 +279,8 @@ AsyncSearch(CTraceContext c_trace,
          phg_ptr,
          timestamp,
          consistency_level,
-         collection_ttl](folly::CancellationToken cancel_token) {
+         collection_ttl,
+         entity_ttl_physical_time_us](folly::CancellationToken cancel_token) {
             // save trace context into search_info
             auto& trace_ctx = plan->plan_node_->search_info_.trace_ctx_;
             trace_ctx.traceID = c_trace.traceID;
@@ -295,7 +297,8 @@ AsyncSearch(CTraceContext c_trace,
                                                  timestamp,
                                                  cancel_token,
                                                  consistency_level,
-                                                 collection_ttl);
+                                                 collection_ttl,
+                                                 entity_ttl_physical_time_us);
             if (!milvus::PositivelyRelated(
                     plan->plan_node_->search_info_.metric_type_)) {
                 for (auto& dis : search_result->distances_) {
@@ -345,7 +348,8 @@ AsyncRetrieve(CTraceContext c_trace,
               int64_t limit_size,
               bool ignore_non_pk,
               int32_t consistency_level,
-              uint64_t collection_ttl) {
+              uint64_t collection_ttl,
+              uint64_t entity_ttl_physical_time_us) {
     auto segment = static_cast<milvus::segcore::SegmentInterface*>(c_segment);
     auto plan = static_cast<const milvus::query::RetrievePlan*>(c_plan);
     auto future = milvus::futures::Future<CRetrieveResult>::async(
@@ -358,21 +362,24 @@ AsyncRetrieve(CTraceContext c_trace,
          limit_size,
          ignore_non_pk,
          consistency_level,
-         collection_ttl](folly::CancellationToken cancel_token) {
+         collection_ttl,
+         entity_ttl_physical_time_us](folly::CancellationToken cancel_token) {
             auto trace_ctx = milvus::tracer::TraceContext{
                 c_trace.traceID, c_trace.spanID, c_trace.traceFlags};
             milvus::tracer::AutoSpan span("SegCoreRetrieve", &trace_ctx, true);
 
             segment->LazyCheckSchema(plan->schema_);
 
-            auto retrieve_result = segment->Retrieve(&trace_ctx,
-                                                     plan,
-                                                     timestamp,
-                                                     limit_size,
-                                                     ignore_non_pk,
-                                                     cancel_token,
-                                                     consistency_level,
-                                                     collection_ttl);
+            auto retrieve_result =
+                segment->Retrieve(&trace_ctx,
+                                  plan,
+                                  timestamp,
+                                  limit_size,
+                                  ignore_non_pk,
+                                  cancel_token,
+                                  consistency_level,
+                                  collection_ttl,
+                                  entity_ttl_physical_time_us);
 
             return CreateLeakedCRetrieveResultFromProto(
                 std::move(retrieve_result));
@@ -596,38 +603,6 @@ UpdateSealedSegmentIndex(CSegmentInterface c_segment,
 }
 
 CStatus
-LoadTextIndex(CSegmentInterface c_segment,
-              const uint8_t* serialized_load_text_index_info,
-              const uint64_t len,
-              CLoadCancellationSource source) {
-    SCOPE_CGO_CALL_METRIC();
-
-    try {
-        auto segment_interface =
-            reinterpret_cast<milvus::segcore::SegmentInterface*>(c_segment);
-        auto segment =
-            dynamic_cast<milvus::segcore::SegmentSealed*>(segment_interface);
-        AssertInfo(segment != nullptr, "segment conversion failed");
-
-        auto info_proto =
-            std::make_unique<milvus::proto::indexcgo::LoadTextIndexInfo>();
-        info_proto->ParseFromArray(serialized_load_text_index_info, len);
-
-        if (source) {
-            auto cancellation_source =
-                static_cast<folly::CancellationSource*>(source);
-            milvus::OpContext op_ctx(cancellation_source->getToken());
-            segment->LoadTextIndex(std::move(info_proto), &op_ctx);
-        } else {
-            segment->LoadTextIndex(std::move(info_proto), nullptr);
-        }
-        return milvus::SuccessCStatus();
-    } catch (std::exception& e) {
-        return milvus::FailureCStatus(&e);
-    }
-}
-
-CStatus
 LoadJsonKeyIndex(CTraceContext c_trace,
                  CSegmentInterface c_segment,
                  const uint8_t* serialized_load_json_key_index_info,
@@ -701,9 +676,9 @@ LoadJsonKeyIndex(CTraceContext c_trace,
         {
             milvus::ScopedTimer timer(
                 "json_stats_load",
-                [](double ms) {
+                [](double us) {
                     milvus::monitor::internal_json_stats_latency_load.Observe(
-                        ms);
+                        us / 1000.0);
                 },
                 milvus::ScopedTimer::LogLevel::Info);
             index->Load(ctx, config);
@@ -794,57 +769,12 @@ DropSealedSegmentJSONIndex(CSegmentInterface c_segment,
     }
 }
 
-CStatus
-AddFieldDataInfoForSealed(CSegmentInterface c_segment,
-                          CLoadFieldDataInfo c_load_field_data_info) {
-    SCOPE_CGO_CALL_METRIC();
-
-    try {
-        auto segment_interface =
-            reinterpret_cast<milvus::segcore::SegmentInterface*>(c_segment);
-        auto segment =
-            dynamic_cast<milvus::segcore::SegmentSealed*>(segment_interface);
-        AssertInfo(segment != nullptr, "segment conversion failed");
-        auto load_info =
-            static_cast<LoadFieldDataInfo*>(c_load_field_data_info);
-        segment->AddFieldDataInfoForSealed(*load_info);
-        return milvus::SuccessCStatus();
-    } catch (std::exception& e) {
-        return milvus::FailureCStatus(milvus::UnexpectedError, e.what());
-    }
-}
-
 void
 RemoveFieldFile(CSegmentInterface c_segment, int64_t field_id) {
     SCOPE_CGO_CALL_METRIC();
 
     auto segment = reinterpret_cast<milvus::segcore::SegmentSealed*>(c_segment);
     segment->RemoveFieldFile(milvus::FieldId(field_id));
-}
-
-CStatus
-CreateTextIndex(CSegmentInterface c_segment,
-                int64_t field_id,
-                CLoadCancellationSource source) {
-    SCOPE_CGO_CALL_METRIC();
-
-    try {
-        auto segment_interface =
-            reinterpret_cast<milvus::segcore::SegmentInterface*>(c_segment);
-        if (source) {
-            auto cancellation_source =
-                static_cast<folly::CancellationSource*>(source);
-            milvus::OpContext op_ctx(cancellation_source->getToken());
-            segment_interface->CreateTextIndex(milvus::FieldId(field_id),
-                                               &op_ctx);
-        } else {
-            segment_interface->CreateTextIndex(milvus::FieldId(field_id),
-                                               nullptr);
-        }
-        return milvus::SuccessCStatus();
-    } catch (std::exception& e) {
-        return milvus::FailureCStatus(milvus::UnexpectedError, e.what());
-    }
 }
 
 CStatus

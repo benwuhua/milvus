@@ -50,7 +50,7 @@ type LoadFieldDataRequest struct {
 type LoadFieldDataInfo struct {
 	Field        *datapb.FieldBinlog
 	EnableMMap   bool
-	WarmupPolicy string // Per-field warmup policy: "disable", "sync", or empty for default
+	WarmupPolicy string // Per-field warmup policy: "disable", "sync", "async", or empty for default
 }
 
 func (req *LoadFieldDataRequest) getCLoadFieldDataRequest() (result *cLoadFieldDataRequest, err error) {
@@ -117,10 +117,6 @@ type cLoadFieldDataRequest struct {
 func (req *cLoadFieldDataRequest) Release() {
 	C.DeleteLoadFieldDataInfo(req.cLoadFieldDataInfo)
 }
-
-type AddFieldDataInfoRequest = LoadFieldDataRequest
-
-type AddFieldDataInfoResult struct{}
 
 type ReopenRequest struct {
 	LoadInfo *querypb.SegmentLoadInfo

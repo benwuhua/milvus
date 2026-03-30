@@ -27,6 +27,13 @@
 #include "fmt/format.h"
 #include "index/Meta.h"
 
+namespace milvus::storage {
+class IndexEntryWriter;
+class IndexEntryReader;
+class MemFileManagerImpl;
+using MemFileManagerImplPtr = std::shared_ptr<MemFileManagerImpl>;
+}  // namespace milvus::storage
+
 namespace milvus::index {
 
 enum class ScalarIndexType {
@@ -105,6 +112,8 @@ class ScalarIndex : public IndexBase {
     };
 
  public:
+    using IndexBase::Build;
+
     virtual ScalarIndexType
     GetIndexType() const = 0;
 
@@ -138,12 +147,12 @@ class ScalarIndex : public IndexBase {
     NotIn(size_t n, const T* values) = 0;
 
     virtual const TargetBitmap
-    Range(T value, OpType op) = 0;
+    Range(const T& value, OpType op) = 0;
 
     virtual const TargetBitmap
-    Range(T lower_bound_value,
+    Range(const T& lower_bound_value,
           bool lb_inclusive,
-          T upper_bound_value,
+          const T& upper_bound_value,
           bool ub_inclusive) = 0;
 
     virtual std::optional<T>
@@ -157,6 +166,10 @@ class ScalarIndex : public IndexBase {
         return false;
     }
 
+    // Execute a pattern match operation on the index.
+    // @param pattern: a raw SQL LIKE pattern (e.g. "%hello%", "abc_def"),
+    //   NOT a regex. Implementations must convert internally if needed.
+    // @param op: Match (LIKE), PrefixMatch, PostfixMatch, or InnerMatch.
     virtual const TargetBitmap
     PatternMatch(const std::string& pattern, proto::plan::OpType op) {
         ThrowInfo(Unsupported, "pattern match is not supported");
@@ -180,19 +193,32 @@ class ScalarIndex : public IndexBase {
     virtual int64_t
     Size() = 0;
 
+    // Whether this index can execute a LIKE-pattern query internally.
+    // When true, the framework calls PatternQuery() directly instead of
+    // falling back to brute-force scan.
+    // NOTE: PatternQuery() always accepts a raw SQL LIKE pattern (e.g. "%hello%").
+    // Each index implementation is responsible for converting it to whatever
+    // internal format it needs (e.g., regex for tantivy).
     virtual bool
-    SupportRegexQuery() const {
+    SupportPatternQuery() const {
         return false;
     }
 
+    // Whether the framework should *attempt* to use PatternQuery() for
+    // Match operations. Inverted indexes return false here because they
+    // handle Match via PatternMatch() dispatch instead.
     virtual bool
-    TryUseRegexQuery() const {
+    TryUsePatternQuery() const {
         return true;
     }
 
+    // Execute a LIKE-pattern query on the index.
+    // @param pattern: a raw SQL LIKE pattern (e.g. "%hello%", "abc_def"),
+    //   NOT a regex. Implementations must convert internally if needed
+    //   (e.g., tantivy converts to regex via PatternMatchTranslator).
     virtual const TargetBitmap
-    RegexQuery(const std::string& pattern) {
-        ThrowInfo(Unsupported, "regex query is not supported");
+    PatternQuery(const std::string& pattern) {
+        ThrowInfo(Unsupported, "pattern query is not supported");
     }
 
     virtual void
@@ -204,6 +230,34 @@ class ScalarIndex : public IndexBase {
     LoadWithoutAssemble(const BinarySet& binary_set, const Config& config) {
         ThrowInfo(Unsupported, "LoadWithoutAssemble is not supported");
     }
+
+    // V3 streaming upload - subclasses must implement WriteEntries() instead
+    IndexStatsPtr
+    UploadV3(const Config& config) override;
+
+    // V3 streaming load - loads index from a packed V3 format file
+    // Opens the file and calls LoadEntries() for subclass-specific loading
+    void
+    LoadV3(const Config& config) override;
+
+    virtual void
+    WriteEntries(storage::IndexEntryWriter* writer) {
+        ThrowInfo(Unsupported, "WriteEntries is not implemented");
+    }
+
+    virtual void
+    LoadEntries(storage::IndexEntryReader& reader, const Config& config) {
+        ThrowInfo(Unsupported, "LoadEntries is not implemented");
+    }
+
+ protected:
+    // File manager for V3 upload/load operations
+    storage::MemFileManagerImplPtr file_manager_;
+
+    // Controls the remote path prefix for V3 upload/load.
+    // true  → index_files/...  (default, for normal scalar indexes)
+    // false → text_log/...     (for TextMatchIndex)
+    bool is_index_file_ = true;
 };
 
 template <typename T>

@@ -60,6 +60,7 @@ message FieldIndex {
     IndexInfo index_info = 1;
     bool deleted = 2;
     uint64 create_time = 3;
+    int32 min_schema_version = 4;
 }
 
 message SegmentIndex {
@@ -233,6 +234,8 @@ message StorageConfig {
     string sslCACert = 14;
     string GcpCredentialJSON = 15;
     uint32 max_connections = 16;
+    string ssl_tls_min_version = 17;
+    bool use_crc32c_checksum = 18;
 }
 
 // Synchronously modify OptionalFieldInfo in index_cgo_msg.proto file
@@ -341,6 +344,12 @@ message UpdateExternalCollectionTask {
     string fail_reason = 6;
     string external_source = 7;
     string external_spec = 8;
+    // Fields for job tracking
+    int64 job_id = 9;            // Unique job identifier for API tracking
+    int64 start_time = 10;       // Job start timestamp (Unix ms)
+    int64 end_time = 11;         // Job end timestamp (Unix ms, 0 if not completed)
+    int64 progress = 12;         // Progress percentage (0-100)
+    string collection_name = 13; // Collection name for API response
 }
 
 enum StatsSubJob {

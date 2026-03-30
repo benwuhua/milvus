@@ -44,6 +44,7 @@
 #include "exec/operator/RescoresNode.h"
 #include "exec/operator/SearchGroupByNode.h"
 #include "exec/operator/VectorSearchNode.h"
+#include "exec/operator/QueryOrderByNode.h"
 #include "fmt/core.h"
 #include "folly/Executor.h"
 #include "folly/Unit.h"
@@ -62,8 +63,9 @@ DriverContext::GetQueryConfig() {
 }
 
 std::shared_ptr<Driver>
-DriverFactory::CreateDriver(std::unique_ptr<DriverContext> ctx,
-                            std::function<int(int pipelineid)> num_drivers) {
+DriverFactory::CreateDriver(
+    std::unique_ptr<DriverContext> ctx,
+    const std::function<int(int pipelineid)>& num_drivers) {
     auto driver = std::shared_ptr<Driver>(new Driver());
     ctx->driver_ = driver.get();
     std::vector<std::unique_ptr<Operator>> operators;
@@ -114,6 +116,12 @@ DriverFactory::CreateDriver(std::unique_ptr<DriverContext> ctx,
             tracer::AddEvent("create_operator: ProjectNode");
             operators.push_back(
                 std::make_unique<PhyProjectNode>(id, ctx.get(), projectNode));
+        } else if (auto orderByNode =
+                       std::dynamic_pointer_cast<const plan::OrderByNode>(
+                           plannode)) {
+            tracer::AddEvent("create_operator: QueryOrderByNode");
+            operators.push_back(std::make_unique<PhyQueryOrderByNode>(
+                id, ctx.get(), orderByNode));
         } else if (auto samplenode =
                        std::dynamic_pointer_cast<const plan::RandomSampleNode>(
                            plannode)) {

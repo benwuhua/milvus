@@ -248,9 +248,16 @@ func (mt *MetaTable) reload() error {
 			return err
 		}
 		for _, collection := range collections {
-			if collection.DBName == "" {
-				collection.DBName = dbName
+			if collection.DBName != "" && collection.DBName != dbName {
+				log.Ctx(mt.ctx).Warn(
+					"collection dbname is not correct, it will be fixed",
+					zap.Int64("collection_id", collection.CollectionID),
+					zap.String("db_name", dbName),
+					zap.String("collection_name", collection.Name),
+					zap.String("collection_dbname", collection.DBName),
+				)
 			}
+			collection.DBName = dbName // some collections may not have db name or its dbname is not correct, we should fix it here.
 			mt.collID2Meta[collection.CollectionID] = collection
 			if collection.Available() {
 				mt.names.insert(dbName, collection.Name, collection.CollectionID)
@@ -613,6 +620,14 @@ func (mt *MetaTable) DropCollection(ctx context.Context, collectionID UniqueID, 
 
 	log.Ctx(ctx).Info("drop collection from meta table", zap.Int64("collection", collectionID),
 		zap.String("state", coll.State.String()), zap.Uint64("ts", ts))
+
+	// Delete all grants referencing this collection immediately so they don't
+	// linger until the tombstone sweeper runs (which can take minutes).
+	if err := mt.catalog.DeleteGrantByCollectionName(ctx1, util.DefaultTenant, db.Name, coll.Name); err != nil {
+		log.Ctx(ctx).Warn("failed to delete grants for dropped collection, skipping",
+			zap.String("dbName", db.Name), zap.String("collectionName", coll.Name), zap.Error(err))
+	}
+
 	return nil
 }
 
@@ -689,6 +704,11 @@ func (mt *MetaTable) RemoveCollection(ctx context.Context, collectionID UniqueID
 	}
 	if err := mt.catalog.DropCollection(ctx1, newColl, ts); err != nil {
 		return err
+	}
+
+	if err := mt.catalog.DeleteGrantByCollectionName(ctx1, util.DefaultTenant, coll.DBName, coll.Name); err != nil {
+		log.Ctx(ctx).Warn("failed to delete grants for dropped collection, skipping",
+			zap.String("dbName", coll.DBName), zap.String("collectionName", coll.Name), zap.Error(err))
 	}
 
 	allNames := common.CloneStringList(aliases)
@@ -1023,6 +1043,14 @@ func (mt *MetaTable) AlterCollection(ctx context.Context, result message.Broadca
 	} else {
 		if err := mt.catalog.AlterCollectionDB(ctx1, oldColl, newColl, newColl.UpdateTimestamp); err != nil {
 			return err
+		}
+	}
+
+	if oldColl.Name != newColl.Name || oldColl.DBName != newColl.DBName {
+		if err := mt.catalog.MigrateGrantCollectionName(ctx1, util.DefaultTenant, oldColl.DBName, oldColl.Name, newColl.DBName, newColl.Name); err != nil {
+			log.Ctx(ctx).Warn("failed to migrate grants for renamed collection, skipping",
+				zap.String("oldDBName", oldColl.DBName), zap.String("oldName", oldColl.Name),
+				zap.String("newDBName", newColl.DBName), zap.String("newName", newColl.Name), zap.Error(err))
 		}
 	}
 

@@ -35,7 +35,6 @@ import (
 	"github.com/milvus-io/milvus/internal/distributed/streaming"
 	"github.com/milvus-io/milvus/internal/metastore/kv/binlog"
 	"github.com/milvus-io/milvus/internal/storage"
-	"github.com/milvus-io/milvus/internal/streamingcoord/server/balancer/balance"
 	"github.com/milvus-io/milvus/internal/streamingcoord/server/balancer/channel"
 	"github.com/milvus-io/milvus/internal/streamingcoord/server/broadcaster/broadcast"
 	"github.com/milvus-io/milvus/internal/util/componentutil"
@@ -47,6 +46,7 @@ import (
 	"github.com/milvus-io/milvus/pkg/v2/metrics"
 	"github.com/milvus-io/milvus/pkg/v2/proto/datapb"
 	"github.com/milvus-io/milvus/pkg/v2/proto/internalpb"
+	"github.com/milvus-io/milvus/pkg/v2/proto/messagespb"
 	"github.com/milvus-io/milvus/pkg/v2/streaming/util/message"
 	"github.com/milvus-io/milvus/pkg/v2/util/funcutil"
 	"github.com/milvus-io/milvus/pkg/v2/util/merr"
@@ -194,35 +194,11 @@ func (s *Server) FlushAll(ctx context.Context, req *datapb.FlushAllRequest) (*da
 	}
 	defer broadcaster.Close()
 
-	// Get broadcast pchannels
-	balancer, err := balance.GetWithContext(ctx)
-	if err != nil {
-		return &datapb.FlushAllResponse{
-			Status: merr.Status(err),
-		}, nil
-	}
-	latestAssignment, err := balancer.GetLatestChannelAssignment()
-	if err != nil {
-		return &datapb.FlushAllResponse{
-			Status: merr.Status(err),
-		}, nil
-	}
-	controlChannel := streaming.WAL().ControlChannel()
-	pchannels := lo.MapToSlice(latestAssignment.PChannelView.Channels, func(_ channel.ChannelID, channel *channel.PChannelMeta) string {
-		return channel.Name()
-	})
-	broadcastPChannels := lo.Map(pchannels, func(pchannel string, _ int) string {
-		if funcutil.IsOnPhysicalChannel(controlChannel, pchannel) {
-			// return control channel if the control channel is on the pchannel.
-			return controlChannel
-		}
-		return pchannel
-	})
-
+	cc := channel.GetClusterChannels()
 	broadcastFlushAllMsg := message.NewFlushAllMessageBuilderV2().
 		WithHeader(&message.FlushAllMessageHeader{}).
 		WithBody(&message.FlushAllMessageBody{}).
-		WithBroadcast(broadcastPChannels).
+		WithClusterLevelBroadcast(cc).
 		MustBuildBroadcast()
 	res, err := broadcaster.Broadcast(ctx, broadcastFlushAllMsg)
 	if err != nil {
@@ -237,20 +213,20 @@ func (s *Server) FlushAll(ctx context.Context, req *datapb.FlushAllRequest) (*da
 	for _, msg := range msgs {
 		appendResult := res.GetAppendResult(msg.VChannel())
 		// if is control channel, convert it to physical channel.
-		channel := funcutil.ToPhysicalChannel(msg.VChannel())
-		flushAllMsgs[channel] = msg.WithTimeTick(appendResult.TimeTick).
+		pchannel := msg.PChannel()
+		flushAllMsgs[pchannel] = msg.WithTimeTick(appendResult.TimeTick).
 			WithLastConfirmed(appendResult.LastConfirmedMessageID).
 			IntoImmutableMessage(appendResult.MessageID).
 			IntoImmutableMessageProto()
 	}
-	log.Ctx(ctx).Info("FlushAll successfully", zap.Strings("broadcastedPChannels", broadcastPChannels), log.FieldMessages(msgs))
+	log.Ctx(ctx).Info("FlushAll successfully", log.FieldMessages(msgs))
 	return &datapb.FlushAllResponse{
 		Status:       merr.Success(),
 		FlushAllMsgs: flushAllMsgs,
 		ClusterInfo: &milvuspb.ClusterInfo{
 			ClusterId: Params.CommonCfg.ClusterID.GetValue(),
-			Cchannel:  controlChannel,
-			Pchannels: pchannels,
+			Cchannel:  cc.ControlChannel,
+			Pchannels: cc.Channels,
 		},
 	}, nil
 }
@@ -669,6 +645,13 @@ func (s *Server) SaveBinlogPaths(ctx context.Context, req *datapb.SaveBinlogPath
 		zap.Strings("bm25logs", stringifyBinlogs(req.GetField2Bm25LogPaths())),
 	)
 
+	// Validate manifest segment after update
+	if segment := s.meta.GetSegment(ctx, req.GetSegmentID()); segment != nil {
+		if msg := ValidateManifestSegment(segment); msg != "" {
+			log.Warn("manifest segment validation warning", zap.String("detail", msg))
+		}
+	}
+
 	if req.GetSegLevel() == datapb.SegmentLevel_L0 {
 		metrics.DataCoordSizeStoredL0Segment.WithLabelValues(fmt.Sprint(req.GetCollectionID())).Observe(calculateL0SegmentSize(req.GetField2StatslogPaths()))
 
@@ -738,7 +721,7 @@ func (s *Server) DropVirtualChannel(ctx context.Context, req *datapb.DropVirtual
 	}
 	s.segmentManager.DropSegmentsOfChannel(ctx, channel)
 	s.compactionInspector.removeTasksByChannel(channel)
-	metrics.DataCoordCheckpointUnixSeconds.DeleteLabelValues(fmt.Sprint(paramtable.GetNodeID()), channel)
+	metrics.DataCoordCheckpointUnixSeconds.DeleteLabelValues(paramtable.GetStringNodeID(), channel)
 	s.meta.MarkChannelCheckpointDropped(ctx, channel)
 
 	// no compaction triggered in Drop procedure
@@ -1013,14 +996,15 @@ func (s *Server) GetRecoveryInfoV2(ctx context.Context, req *datapb.GetRecoveryI
 		}
 
 		segmentInfos = append(segmentInfos, &datapb.SegmentInfo{
-			ID:            segment.ID,
-			PartitionID:   segment.PartitionID,
-			CollectionID:  segment.CollectionID,
-			InsertChannel: segment.InsertChannel,
-			NumOfRows:     rowCount,
-			Level:         segment.GetLevel(),
-			IsSorted:      segment.GetIsSorted(),
-			ManifestPath:  segment.GetManifestPath(),
+			ID:                  segment.ID,
+			PartitionID:         segment.PartitionID,
+			CollectionID:        segment.CollectionID,
+			InsertChannel:       segment.InsertChannel,
+			NumOfRows:           rowCount,
+			Level:               segment.GetLevel(),
+			IsSorted:            segment.GetIsSorted(),
+			IsSortedByNamespace: segment.GetIsSortedByNamespace(),
+			ManifestPath:        segment.GetManifestPath(),
 		})
 	}
 
@@ -1803,6 +1787,8 @@ func (s *Server) GetGcStatus(ctx context.Context) (*datapb.GetGcStatusResponse, 
 	}, nil
 }
 
+// ImportV2 handles import requests from proxy by broadcasting import messages.
+// This is the entry point for all user-initiated imports.
 func (s *Server) ImportV2(ctx context.Context, in *internalpb.ImportRequestInternal) (*internalpb.ImportResponse, error) {
 	if err := merr.CheckHealthy(s.GetStateCode()); err != nil {
 		return &internalpb.ImportResponse{
@@ -1817,8 +1803,81 @@ func (s *Server) ImportV2(ctx context.Context, in *internalpb.ImportRequestInter
 	log := log.Ctx(ctx).With(zap.Int64("collection", in.GetCollectionID()),
 		zap.Int64s("partitions", in.GetPartitionIDs()),
 		zap.Strings("channels", in.GetChannelNames()))
-	log.Info("receive import request", zap.Int("fileNum", len(in.GetFiles())),
-		zap.Any("files", in.GetFiles()), zap.Any("options", in.GetOptions()))
+
+	log.Info("receive import request from proxy, will broadcast",
+		zap.Int("fileNum", len(in.GetFiles())),
+		zap.Any("files", in.GetFiles()),
+		zap.Any("options", in.GetOptions()))
+
+	// Validate timeout before allocating resources
+	// Full validation will happen during broadcast
+	_, err := importutilv2.GetTimeoutTs(in.GetOptions())
+	if err != nil {
+		resp.Status = merr.Status(merr.WrapErrImportFailed(err.Error()))
+		return resp, nil
+	}
+
+	// Use the incoming JobID if provided (backward compat: old proxy allocates jobID
+	// before sending broadcast RPC, which is forwarded here with the original jobID).
+	// Otherwise allocate a new one.
+	jobID := in.GetJobID()
+	if jobID == 0 {
+		if s.allocator == nil {
+			resp.Status = merr.Status(merr.WrapErrImportFailed("allocator not initialized"))
+			return resp, nil
+		}
+		jobID, _, err = s.allocator.AllocN(1)
+		if err != nil {
+			resp.Status = merr.Status(merr.WrapErrImportFailed(fmt.Sprintf("failed to allocate job ID: %v", err)))
+			return resp, nil
+		}
+	}
+
+	// Broadcast the import message
+	// dbName is retrieved inside broadcastImport via broker.DescribeCollectionInternal
+	err = s.broadcastImport(
+		ctx,
+		in.GetCollectionName(),
+		in.GetCollectionID(),
+		in.GetPartitionIDs(),
+		in.GetFiles(),
+		in.GetOptions(),
+		in.GetSchema(),
+		jobID,
+		in.GetChannelNames(),
+	)
+	if err != nil {
+		log.Warn("failed to broadcast import message", zap.Error(err))
+		resp.Status = merr.Status(merr.WrapErrImportFailed(fmt.Sprintf("failed to broadcast import: %v", err)))
+		return resp, nil
+	}
+
+	resp.JobID = fmt.Sprint(jobID)
+	log.Info("import request broadcasted successfully", zap.String("jobID", resp.JobID))
+	return resp, nil
+}
+
+// createImportJobFromAck creates an import job from ack callback.
+// This is called internally when broadcast ack is received.
+func (s *Server) createImportJobFromAck(ctx context.Context, in *internalpb.ImportRequestInternal) (*internalpb.ImportResponse, error) {
+	if err := merr.CheckHealthy(s.GetStateCode()); err != nil {
+		return &internalpb.ImportResponse{
+			Status: merr.Status(err),
+		}, nil
+	}
+
+	resp := &internalpb.ImportResponse{
+		Status: merr.Success(),
+	}
+
+	log := log.Ctx(ctx).With(zap.Int64("collection", in.GetCollectionID()),
+		zap.Int64s("partitions", in.GetPartitionIDs()),
+		zap.Strings("channels", in.GetChannelNames()))
+
+	log.Info("creating import job from ack callback",
+		zap.Int("fileNum", len(in.GetFiles())),
+		zap.Any("files", in.GetFiles()),
+		zap.Any("options", in.GetOptions()))
 
 	timeoutTs, err := importutilv2.GetTimeoutTs(in.GetOptions())
 	if err != nil {
@@ -1839,7 +1898,7 @@ func (s *Server) ImportV2(ctx context.Context, in *internalpb.ImportRequestInter
 	// Allocate file ids.
 	idStart, _, err := s.allocator.AllocN(int64(len(files)) + 1)
 	if err != nil {
-		resp.Status = merr.Status(merr.WrapErrImportFailed(fmt.Sprint("alloc id failed, err=%w", err)))
+		resp.Status = merr.Status(merr.WrapErrImportFailed(fmt.Sprintf("alloc id failed: %v", err)))
 		return resp, nil
 	}
 	files = lo.Map(files, func(importFile *internalpb.ImportFile, i int) *internalpb.ImportFile {
@@ -1852,7 +1911,7 @@ func (s *Server) ImportV2(ctx context.Context, in *internalpb.ImportRequestInter
 		return resp, nil
 	}
 	if err != nil {
-		resp.Status = merr.Status(merr.WrapErrImportFailed(fmt.Sprint("get collection failed, err=%w", err)))
+		resp.Status = merr.Status(merr.WrapErrImportFailed(fmt.Sprintf("get collection failed: %v", err)))
 		return resp, nil
 	}
 	if importCollectionInfo == nil {
@@ -1886,7 +1945,7 @@ func (s *Server) ImportV2(ctx context.Context, in *internalpb.ImportRequestInter
 	}
 	err = s.importMeta.AddJob(ctx, job)
 	if err != nil {
-		resp.Status = merr.Status(merr.WrapErrImportFailed(fmt.Sprint("add import job failed, err=%w", err)))
+		resp.Status = merr.Status(merr.WrapErrImportFailed(fmt.Sprintf("add import job failed: %v", err)))
 		return resp, nil
 	}
 
@@ -1913,7 +1972,7 @@ func (s *Server) GetImportProgress(ctx context.Context, in *internalpb.GetImport
 	}
 	jobID, err := strconv.ParseInt(in.GetJobID(), 10, 64)
 	if err != nil {
-		resp.Status = merr.Status(merr.WrapErrImportFailed(fmt.Sprint("parse job id failed, err=%w", err)))
+		resp.Status = merr.Status(merr.WrapErrImportFailed(fmt.Sprintf("parse job id failed: %v", err)))
 		return resp, nil
 	}
 
@@ -1982,48 +2041,11 @@ func (s *Server) NotifyDropPartition(ctx context.Context, channel string, partit
 	return s.meta.DropSegmentsOfPartition(ctx, partitionIDs)
 }
 
-// CreateExternalCollection creates an external collection in datacoord
-// This is a skeleton implementation - details to be filled in later
-func (s *Server) CreateExternalCollection(ctx context.Context, req *msgpb.CreateCollectionRequest) (*datapb.CreateExternalCollectionResponse, error) {
-	log := log.Ctx(ctx).With(
-		zap.String("dbName", req.GetDbName()),
-		zap.String("collectionName", req.GetCollectionName()),
-		zap.Int64("dbID", req.GetDbID()),
-		zap.Int64("collectionID", req.GetCollectionID()))
-
-	log.Info("receive CreateExternalCollection request")
-
-	// Check if server is healthy
-	if err := merr.CheckHealthy(s.GetStateCode()); err != nil {
-		log.Warn("server is not healthy", zap.Error(err))
-		return &datapb.CreateExternalCollectionResponse{
-			Status: merr.Status(err),
-		}, nil
-	}
-
-	// Create collection info and add to meta
-	// This will make the collection visible to inspectors
-	// The collection schema already contains external_source and external_spec fields
-	collInfo := &collectionInfo{
-		ID:            req.GetCollectionID(),
-		Schema:        req.GetCollectionSchema(),
-		Partitions:    req.GetPartitionIDs(),
-		Properties:    make(map[string]string),
-		DatabaseID:    req.GetDbID(),
-		DatabaseName:  req.GetDbName(),
-		VChannelNames: req.GetVirtualChannelNames(),
-	}
-
-	s.meta.AddCollection(collInfo)
-
-	log.Info("CreateExternalCollection: collection added to meta",
-		zap.Int64("collectionID", req.GetCollectionID()),
-		zap.String("collectionName", req.GetCollectionName()),
-		zap.String("externalSource", req.GetCollectionSchema().GetExternalSource()),
-		zap.String("externalSpec", req.GetCollectionSchema().GetExternalSpec()))
-
+// CreateExternalCollection is a no-op stub to satisfy the DataCoordServer interface.
+// External collection creation goes through the standard CreateCollection flow in RootCoord.
+func (s *Server) CreateExternalCollection(_ context.Context, _ *msgpb.CreateCollectionRequest) (*datapb.CreateExternalCollectionResponse, error) {
 	return &datapb.CreateExternalCollectionResponse{
-		Status: merr.Success(),
+		Status: merr.Status(merr.WrapErrServiceInternal("CreateExternalCollection is not supported, use CreateCollection instead")),
 	}, nil
 }
 
@@ -2088,6 +2110,12 @@ func (s *Server) CreateSnapshot(ctx context.Context, req *datapb.CreateSnapshotR
 	}
 	defer broadcaster.Close()
 
+	// check if snapshot name already exists
+	if _, err := s.snapshotManager.GetSnapshot(ctx, req.GetName()); err == nil {
+		log.Warn("CreateSnapshot failed: snapshot name already exists")
+		return merr.Status(merr.WrapErrParameterInvalidMsg("snapshot name %s already exists", req.GetName())), nil
+	}
+
 	// Broadcast CreateSnapshot message via DDL framework
 	// Snapshot ID is allocated in the callback
 	if _, err := broadcaster.Broadcast(ctx, message.NewCreateSnapshotMessageBuilderV2().
@@ -2108,6 +2136,57 @@ func (s *Server) CreateSnapshot(ctx context.Context, req *datapb.CreateSnapshotR
 	return merr.Success(), nil
 }
 
+func (s *Server) BatchUpdateManifest(ctx context.Context, req *datapb.BatchUpdateManifestRequest) (*commonpb.Status, error) {
+	log := log.Ctx(ctx).With(zap.Int64("collectionID", req.GetCollectionId()))
+	if err := merr.CheckHealthy(s.GetStateCode()); err != nil {
+		return merr.Status(err), nil
+	}
+
+	log.Info("receive BatchUpdateManifest request", zap.Int("itemCount", len(req.GetItems())))
+
+	coll, err := s.broker.DescribeCollectionInternal(ctx, req.GetCollectionId())
+	if err != nil {
+		log.Warn("BatchUpdateManifest failed to describe collection", zap.Error(err))
+		return merr.Status(err), nil
+	}
+	dbName := coll.GetDbName()
+	collectionName := coll.GetCollectionName()
+	broadcaster, err := broadcast.StartBroadcastWithResourceKeys(ctx,
+		message.NewSharedDBNameResourceKey(dbName),
+		message.NewSharedCollectionNameResourceKey(dbName, collectionName),
+	)
+	if err != nil {
+		log.Warn("BatchUpdateManifest failed to start broadcast", zap.Error(err))
+		return merr.Status(err), nil
+	}
+	defer broadcaster.Close()
+
+	items := make([]*messagespb.BatchUpdateManifestItem, 0, len(req.GetItems()))
+	for _, item := range req.GetItems() {
+		items = append(items, &messagespb.BatchUpdateManifestItem{
+			SegmentId:       item.GetSegmentId(),
+			ManifestVersion: item.GetManifestVersion(),
+		})
+	}
+
+	if _, err := broadcaster.Broadcast(ctx, message.NewBatchUpdateManifestMessageBuilderV2().
+		WithHeader(&message.BatchUpdateManifestMessageHeader{
+			CollectionId: req.GetCollectionId(),
+		}).
+		WithBody(&message.BatchUpdateManifestMessageBody{
+			Items: items,
+		}).
+		WithBroadcast([]string{streaming.WAL().ControlChannel()}).
+		MustBuildBroadcast(),
+	); err != nil {
+		log.Error("BatchUpdateManifest broadcast failed", zap.Error(err))
+		return merr.Status(err), nil
+	}
+
+	log.Info("BatchUpdateManifest completed successfully")
+	return merr.Success(), nil
+}
+
 func (s *Server) DropSnapshot(ctx context.Context, req *datapb.DropSnapshotRequest) (*commonpb.Status, error) {
 	log := log.Ctx(ctx).With(zap.String("snapshot", req.GetName()))
 	if err := merr.CheckHealthy(s.GetStateCode()); err != nil {
@@ -2117,7 +2196,7 @@ func (s *Server) DropSnapshot(ctx context.Context, req *datapb.DropSnapshotReque
 
 	// Check if snapshot exists - if not, return success (idempotent)
 	if _, err := s.snapshotManager.GetSnapshot(ctx, req.GetName()); err != nil {
-		log.Info("DropSnapshot: snapshot not found, returning success (idempotent)")
+		log.Info("DropSnapshot: snapshot not found, returning success (idempotent)", zap.Error(err))
 		return merr.Success(), nil
 	}
 
@@ -2132,6 +2211,23 @@ func (s *Server) DropSnapshot(ctx context.Context, req *datapb.DropSnapshotReque
 		return merr.Status(err), nil
 	}
 	defer broadcaster.Close()
+
+	// Double-check after acquiring lock - another goroutine may have dropped it
+	if _, err := s.snapshotManager.GetSnapshot(ctx, req.GetName()); err != nil {
+		log.Info("DropSnapshot: snapshot not found after lock, returning success (idempotent)", zap.Error(err))
+		return merr.Success(), nil
+	}
+
+	// Check if snapshot is being restored
+	snapshotName := req.GetName()
+	if refCount := s.snapshotManager.GetSnapshotRestoreRefCount(snapshotName); refCount > 0 {
+		reason := fmt.Sprintf("snapshot %s is restoring, %d restore operations in progress",
+			snapshotName, refCount)
+		log.Warn("cannot drop snapshot with active restore operations",
+			zap.String("snapshot", snapshotName),
+			zap.Int32("activeRestoreCount", refCount))
+		return merr.Status(merr.WrapErrServiceInternal(reason)), nil
+	}
 
 	// Broadcast DropSnapshot message via DDL framework
 	if _, err := broadcaster.Broadcast(ctx, message.NewDropSnapshotMessageBuilderV2().
@@ -2329,5 +2425,148 @@ func (s *Server) ListSnapshots(ctx context.Context, req *datapb.ListSnapshotsReq
 	return &datapb.ListSnapshotsResponse{
 		Status:    merr.Success(),
 		Snapshots: snapshots,
+	}, nil
+}
+
+// RefreshExternalCollection manually triggers a refresh job for an external collection
+// This uses WAL Broadcast mechanism for idempotency and distributed consistency.
+func (s *Server) RefreshExternalCollection(ctx context.Context, req *datapb.RefreshExternalCollectionRequest) (*datapb.RefreshExternalCollectionResponse, error) {
+	log := log.Ctx(ctx).With(
+		zap.Int64("collectionID", req.GetCollectionId()),
+		zap.String("collectionName", req.GetCollectionName()))
+
+	if err := merr.CheckHealthy(s.GetStateCode()); err != nil {
+		return &datapb.RefreshExternalCollectionResponse{
+			Status: merr.Status(err),
+		}, nil
+	}
+
+	log.Info("receive RefreshExternalCollection request")
+
+	if s.externalCollectionRefreshManager == nil {
+		log.Warn("external collection refresh manager not initialized")
+		return &datapb.RefreshExternalCollectionResponse{
+			Status: merr.Status(merr.WrapErrServiceUnavailable("external collection refresh manager not initialized")),
+		}, nil
+	}
+
+	// Pre-allocate JobID for idempotency (ensures same JobID even if retry after failure)
+	allocatedJobID, err := s.allocator.AllocID(ctx)
+	if err != nil {
+		log.Warn("failed to allocate job ID", zap.Error(err))
+		return &datapb.RefreshExternalCollectionResponse{
+			Status: merr.Status(err),
+		}, nil
+	}
+	log.Info("pre-allocated job ID for refresh", zap.Int64("jobID", allocatedJobID))
+
+	// Start broadcaster with resource lock (shared DB + exclusive collection)
+	b, err := s.startBroadcastWithCollectionID(ctx, req.GetCollectionId())
+	if err != nil {
+		log.Warn("failed to start broadcaster", zap.Error(err))
+		return &datapb.RefreshExternalCollectionResponse{
+			Status: merr.Status(err),
+		}, nil
+	}
+	defer b.Close()
+
+	// Build and broadcast the message
+	msg := message.NewRefreshExternalCollectionMessageBuilderV2().
+		WithHeader(&message.RefreshExternalCollectionMessageHeader{
+			CollectionId:   req.GetCollectionId(),
+			CollectionName: req.GetCollectionName(),
+			JobId:          allocatedJobID,
+			ExternalSource: req.GetExternalSource(),
+			ExternalSpec:   req.GetExternalSpec(),
+		}).
+		WithBody(&message.RefreshExternalCollectionMessageBody{}).
+		WithBroadcast([]string{streaming.WAL().ControlChannel()}).
+		MustBuildBroadcast()
+
+	if _, err := b.Broadcast(ctx, msg); err != nil {
+		log.Warn("failed to broadcast refresh message", zap.Error(err))
+		return &datapb.RefreshExternalCollectionResponse{
+			Status: merr.Status(err),
+		}, nil
+	}
+
+	log.Info("refresh external collection job submitted via WAL broadcast", zap.Int64("jobID", allocatedJobID))
+
+	return &datapb.RefreshExternalCollectionResponse{
+		Status: merr.Success(),
+		JobId:  allocatedJobID,
+	}, nil
+}
+
+// GetRefreshExternalCollectionProgress returns the progress of a refresh job
+func (s *Server) GetRefreshExternalCollectionProgress(ctx context.Context, req *datapb.GetRefreshExternalCollectionProgressRequest) (*datapb.GetRefreshExternalCollectionProgressResponse, error) {
+	log := log.Ctx(ctx).With(zap.Int64("jobID", req.GetJobId()))
+
+	if err := merr.CheckHealthy(s.GetStateCode()); err != nil {
+		return &datapb.GetRefreshExternalCollectionProgressResponse{
+			Status: merr.Status(err),
+		}, nil
+	}
+
+	log.Info("receive GetRefreshExternalCollectionProgress request")
+
+	if s.externalCollectionRefreshManager == nil {
+		log.Warn("external collection refresh manager not initialized")
+		return &datapb.GetRefreshExternalCollectionProgressResponse{
+			Status: merr.Status(merr.WrapErrServiceUnavailable("external collection refresh manager not initialized")),
+		}, nil
+	}
+
+	jobInfo, err := s.externalCollectionRefreshManager.GetJobProgress(ctx, req.GetJobId())
+	if err != nil {
+		log.Warn("failed to get job progress", zap.Error(err))
+		return &datapb.GetRefreshExternalCollectionProgressResponse{
+			Status: merr.Status(err),
+		}, nil
+	}
+
+	log.Info("get refresh external collection progress completed",
+		zap.String("state", jobInfo.GetState().String()),
+		zap.Int64("progress", jobInfo.GetProgress()))
+
+	return &datapb.GetRefreshExternalCollectionProgressResponse{
+		Status:  merr.Success(),
+		JobInfo: jobInfo,
+	}, nil
+}
+
+// ListRefreshExternalCollectionJobs lists refresh jobs for a collection
+func (s *Server) ListRefreshExternalCollectionJobs(ctx context.Context, req *datapb.ListRefreshExternalCollectionJobsRequest) (*datapb.ListRefreshExternalCollectionJobsResponse, error) {
+	log := log.Ctx(ctx).With(
+		zap.Int64("collectionID", req.GetCollectionId()))
+
+	if err := merr.CheckHealthy(s.GetStateCode()); err != nil {
+		return &datapb.ListRefreshExternalCollectionJobsResponse{
+			Status: merr.Status(err),
+		}, nil
+	}
+
+	log.Info("receive ListRefreshExternalCollectionJobs request")
+
+	if s.externalCollectionRefreshManager == nil {
+		log.Warn("external collection refresh manager not initialized")
+		return &datapb.ListRefreshExternalCollectionJobsResponse{
+			Status: merr.Status(merr.WrapErrServiceUnavailable("external collection refresh manager not initialized")),
+		}, nil
+	}
+
+	jobs, err := s.externalCollectionRefreshManager.ListJobs(ctx, req.GetCollectionId())
+	if err != nil {
+		log.Warn("failed to list jobs", zap.Error(err))
+		return &datapb.ListRefreshExternalCollectionJobsResponse{
+			Status: merr.Status(err),
+		}, nil
+	}
+
+	log.Info("list refresh external collection jobs completed", zap.Int("jobCount", len(jobs)))
+
+	return &datapb.ListRefreshExternalCollectionJobsResponse{
+		Status: merr.Success(),
+		Jobs:   jobs,
 	}, nil
 }

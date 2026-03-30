@@ -45,7 +45,7 @@ type insertNode struct {
 func (iNode *insertNode) addInsertData(insertDatas map[UniqueID]*delegator.InsertData, msg *InsertMsg, collection *Collection) {
 	insertRecord, err := storage.TransferInsertMsgToInsertRecord(collection.Schema(), msg)
 	if err != nil {
-		err = fmt.Errorf("failed to get primary keys, err = %d", err)
+		err = fmt.Errorf("failed to get primary keys, err = %v", err)
 		log.Error(err.Error(), zap.Int64("collectionID", iNode.collectionID), zap.String("channel", iNode.channel))
 		panic(err)
 	}
@@ -88,7 +88,7 @@ func (iNode *insertNode) addInsertData(insertDatas map[UniqueID]*delegator.Inser
 
 // Insert task
 func (iNode *insertNode) Operate(in Msg) Msg {
-	metrics.QueryNodeWaitProcessingMsgCount.WithLabelValues(fmt.Sprint(paramtable.GetNodeID()), metrics.InsertLabel).Dec()
+	metrics.QueryNodeWaitProcessingMsgCount.WithLabelValues(paramtable.GetStringNodeID(), metrics.InsertLabel).Dec()
 	nodeMsg := in.(*insertNodeMsg)
 
 	if len(nodeMsg.insertMsgs) > 0 {
@@ -113,7 +113,7 @@ func (iNode *insertNode) Operate(in Msg) Msg {
 
 		iNode.delegator.ProcessInsert(nodeMsg.insertDatas)
 	}
-	metrics.QueryNodeWaitProcessingMsgCount.WithLabelValues(fmt.Sprint(paramtable.GetNodeID()), metrics.DeleteLabel).Inc()
+	metrics.QueryNodeWaitProcessingMsgCount.WithLabelValues(paramtable.GetStringNodeID(), metrics.DeleteLabel).Inc()
 
 	return &deleteNodeMsg{
 		deleteMsgs:    nodeMsg.deleteMsgs,

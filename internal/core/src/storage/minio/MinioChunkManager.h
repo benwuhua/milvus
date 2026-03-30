@@ -26,6 +26,14 @@
 #include <aws/core/utils/logging/FormattedLogSystem.h>
 #include <aws/s3/S3Client.h>
 #include <fmt/core.h>
+#include <google/cloud/credentials.h>
+#include <google/cloud/internal/oauth2_credentials.h>
+#include <google/cloud/internal/oauth2_compute_engine_credentials.h>
+#include <google/cloud/internal/oauth2_google_credentials.h>
+#include <google/cloud/internal/oauth2_http_client_factory.h>
+#include <google/cloud/internal/rest_client.h>
+#include <google/cloud/storage/oauth2/compute_engine_credentials.h>
+#include <google/cloud/storage/oauth2/google_credentials.h>
 #include <google/cloud/status_or.h>
 #include <stddef.h>
 #include <stdint.h>
@@ -46,9 +54,6 @@
 #include "aws/s3/S3Errors.h"
 #include "common/EasyAssert.h"
 #include "glog/logging.h"
-#include "google/cloud/internal/oauth2_compute_engine_credentials.h"
-#include "google/cloud/internal/oauth2_credentials.h"
-#include "google/cloud/internal/oauth2_google_credentials.h"
 #include "google/cloud/status.h"
 #include "log/Log.h"
 #include "storage/ChunkManager.h"
@@ -64,6 +69,9 @@ enum class RemoteStorageType {
     GOOGLE_CLOUD = 1,
     ALIYUN_CLOUD = 2,
 };
+
+void
+ConfigureGoogleCloudIAMHttpClientFactory(Aws::SDKOptions& sdk_options);
 
 template <typename... Args>
 static std::string
@@ -90,7 +98,7 @@ ThrowS3Error(const std::string& func,
     throw SegcoreError(S3Error, error_message);
 }
 
-static bool
+[[maybe_unused]] static bool
 IsNotFound(const Aws::S3::S3Errors& s3err) {
     return (s3err == Aws::S3::S3Errors::NO_SUCH_KEY ||
             s3err == Aws::S3::S3Errors::RESOURCE_NOT_FOUND);
@@ -224,11 +232,13 @@ class MinioChunkManager : public ChunkManager {
     ListObjects(const std::string& bucket_name, const std::string& prefix = "");
 
     void
-    InitSDKAPIDefault(const std::string& log_level);
+    InitSDKAPIDefault(const std::string& log_level,
+                      const std::string& tls_min_version = "");
     void
     InitSDKAPI(RemoteStorageType type,
                bool useIAM,
-               const std::string& log_level);
+               const std::string& log_level,
+               const std::string& tls_min_version = "");
 
     // Precheck whether client is configure ready or not.
     void
@@ -257,6 +267,7 @@ class MinioChunkManager : public ChunkManager {
     std::shared_ptr<Aws::S3::S3Client> client_;
     std::string default_bucket_name_;
     std::string remote_root_path_;
+    bool use_crc32c_checksum_ = false;
 };
 
 class AwsChunkManager : public MinioChunkManager {
@@ -318,6 +329,78 @@ class HuaweiCloudChunkManager : public MinioChunkManager {
 
 using MinioChunkManagerPtr = std::unique_ptr<MinioChunkManager>;
 
+static const char* TLS_FACTORY_ALLOCATION_TAG = "TlsHttpClientFactory";
+
+static long
+TlsVersionToCurlOpt(const std::string& tls_min_version) {
+    if (tls_min_version == "1.0")
+        return CURL_SSLVERSION_TLSv1_0;
+    if (tls_min_version == "1.1")
+        return CURL_SSLVERSION_TLSv1_1;
+    if (tls_min_version == "1.2")
+        return CURL_SSLVERSION_TLSv1_2;
+    if (tls_min_version == "1.3")
+        return CURL_SSLVERSION_TLSv1_3;
+    return CURL_SSLVERSION_DEFAULT;
+}
+
+class TlsCurlHttpClient : public Aws::Http::CurlHttpClient {
+ public:
+    TlsCurlHttpClient(const Aws::Client::ClientConfiguration& config,
+                      const std::string& tls_min_version)
+        : CurlHttpClient(config),
+          tls_ssl_version_(TlsVersionToCurlOpt(tls_min_version)) {
+    }
+
+ protected:
+    void
+    OverrideOptionsOnConnectionHandle(CURL* handle) const override {
+        if (tls_ssl_version_ != CURL_SSLVERSION_DEFAULT) {
+            curl_easy_setopt(handle, CURLOPT_SSLVERSION, tls_ssl_version_);
+        }
+    }
+
+ private:
+    long tls_ssl_version_;
+};
+
+class TlsHttpClientFactory : public Aws::Http::HttpClientFactory {
+ public:
+    explicit TlsHttpClientFactory(const std::string& tls_min_version)
+        : tls_min_version_(tls_min_version) {
+    }
+
+    std::shared_ptr<Aws::Http::HttpClient>
+    CreateHttpClient(
+        const Aws::Client::ClientConfiguration& config) const override {
+        return Aws::MakeShared<TlsCurlHttpClient>(
+            TLS_FACTORY_ALLOCATION_TAG, config, tls_min_version_);
+    }
+
+    std::shared_ptr<Aws::Http::HttpRequest>
+    CreateHttpRequest(
+        const Aws::String& uri,
+        Aws::Http::HttpMethod method,
+        const Aws::IOStreamFactory& streamFactory) const override {
+        return CreateHttpRequest(Aws::Http::URI(uri), method, streamFactory);
+    }
+
+    std::shared_ptr<Aws::Http::HttpRequest>
+    CreateHttpRequest(
+        const Aws::Http::URI& uri,
+        Aws::Http::HttpMethod method,
+        const Aws::IOStreamFactory& streamFactory) const override {
+        auto request =
+            Aws::MakeShared<Aws::Http::Standard::StandardHttpRequest>(
+                TLS_FACTORY_ALLOCATION_TAG, uri, method);
+        request->SetResponseStreamFactory(streamFactory);
+        return request;
+    }
+
+ private:
+    std::string tls_min_version_;
+};
+
 static const char* GOOGLE_CLIENT_FACTORY_ALLOCATION_TAG =
     "GoogleHttpClientFactory";
 
@@ -325,7 +408,9 @@ class GoogleHttpClientFactory : public Aws::Http::HttpClientFactory {
  public:
     explicit GoogleHttpClientFactory(
         std::shared_ptr<google::cloud::oauth2_internal::Credentials>
-            credentials) {
+            credentials,
+        const std::string& tls_min_version = "")
+        : tls_min_version_(tls_min_version) {
         credentials_ = credentials;
     }
 
@@ -338,6 +423,12 @@ class GoogleHttpClientFactory : public Aws::Http::HttpClientFactory {
     std::shared_ptr<Aws::Http::HttpClient>
     CreateHttpClient(const Aws::Client::ClientConfiguration&
                          clientConfiguration) const override {
+        if (!tls_min_version_.empty() && tls_min_version_ != "default") {
+            return Aws::MakeShared<TlsCurlHttpClient>(
+                GOOGLE_CLIENT_FACTORY_ALLOCATION_TAG,
+                clientConfiguration,
+                tls_min_version_);
+        }
         return Aws::MakeShared<Aws::Http::CurlHttpClient>(
             GOOGLE_CLIENT_FACTORY_ALLOCATION_TAG, clientConfiguration);
     }
@@ -359,12 +450,13 @@ class GoogleHttpClientFactory : public Aws::Http::HttpClientFactory {
             Aws::MakeShared<Aws::Http::Standard::StandardHttpRequest>(
                 GOOGLE_CLIENT_FACTORY_ALLOCATION_TAG, uri, method);
         request->SetResponseStreamFactory(streamFactory);
-        auto auth_header = credentials_->AuthorizationHeader();
+        auto auth_header =
+            google::cloud::oauth2_internal::AuthorizationHeader(*credentials_);
         if (!auth_header.ok()) {
-            ThrowInfo(
-                S3Error,
-                fmt::format("get authorization failed, errcode: {}",
-                            StatusCodeToString(auth_header.status().code())));
+            ThrowInfo(S3Error,
+                      fmt::format("get authorization failed, errcode: {}",
+                                  google::cloud::StatusCodeToString(
+                                      auth_header.status().code())));
         }
         request->SetHeaderValue(auth_header->first.c_str(),
                                 auth_header->second.c_str());
@@ -374,6 +466,7 @@ class GoogleHttpClientFactory : public Aws::Http::HttpClientFactory {
 
  private:
     std::shared_ptr<google::cloud::oauth2_internal::Credentials> credentials_;
+    std::string tls_min_version_;
 };
 
 }  // namespace milvus::storage

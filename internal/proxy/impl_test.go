@@ -19,7 +19,6 @@ package proxy
 import (
 	"context"
 	"fmt"
-	"math/rand"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -478,9 +477,7 @@ func TestProxy_FlushAll_Success(t *testing.T) {
 		mockey.Mock(globalMetaCache.GetCollectionID).To(func(ctx context.Context, dbName, collectionName string) (UniqueID, error) {
 			return UniqueID(0), nil
 		}).Build()
-		mockey.Mock(globalMetaCache.RemoveDatabase).To(func(ctx context.Context, dbName string) error {
-			return nil
-		}).Build()
+		mockey.Mock(globalMetaCache.RemoveDatabase).Return().Build()
 
 		// Mock paramtable initialization
 		mockey.Mock(paramtable.Init).Return().Build()
@@ -534,9 +531,7 @@ func TestProxy_FlushAll_ServerAbnormal(t *testing.T) {
 		mockey.Mock(globalMetaCache.GetCollectionID).To(func(ctx context.Context, dbName, collectionName string) (UniqueID, error) {
 			return UniqueID(0), nil
 		}).Build()
-		mockey.Mock(globalMetaCache.RemoveDatabase).To(func(ctx context.Context, dbName string) error {
-			return nil
-		}).Build()
+		mockey.Mock(globalMetaCache.RemoveDatabase).Return().Build()
 
 		// Mock paramtable initialization
 		mockey.Mock(paramtable.Init).Return().Build()
@@ -984,6 +979,13 @@ func TestProxyDropDatabase(t *testing.T) {
 		mix.EXPECT().DropDatabase(mock.Anything, mock.Anything).Return(merr.Success(), nil)
 		node.mixCoord = mix
 		node.UpdateStateCode(commonpb.StateCode_Healthy)
+
+		cacheBak := globalMetaCache
+		defer func() { globalMetaCache = cacheBak }()
+		cache := NewMockCache(t)
+		cache.EXPECT().RemoveDatabase(mock.Anything, mock.AnythingOfType("string")).Return()
+		globalMetaCache = cache
+
 		ctx := context.Background()
 
 		resp, err := node.DropDatabase(ctx, &milvuspb.DropDatabaseRequest{DbName: "db"})
@@ -1431,6 +1433,20 @@ func TestProxy_ImportV2(t *testing.T) {
 		assert.NoError(t, err)
 		assert.NotEqual(t, int32(0), rsp.GetStatus().GetCode())
 
+		// schema has no fields
+		mc = NewMockCache(t)
+		mc.EXPECT().GetCollectionSchema(mock.Anything, mock.Anything, mock.Anything).Return(&schemaInfo{
+			CollectionSchema: &schemapb.CollectionSchema{},
+		}, nil).Once()
+		mc.EXPECT().GetCollectionID(mock.Anything, mock.Anything, mock.Anything).Return(0, nil)
+		mc.EXPECT().GetCollectionSchema(mock.Anything, mock.Anything, mock.Anything).Return(&schemaInfo{
+			CollectionSchema: &schemapb.CollectionSchema{},
+		}, nil).Once()
+		globalMetaCache = mc
+		rsp, err = node.ImportV2(ctx, &internalpb.ImportRequest{CollectionName: "aaa"})
+		assert.NoError(t, err)
+		assert.NotEqual(t, int32(0), rsp.GetStatus().GetCode())
+
 		// get channel failed
 		mc = NewMockCache(t)
 		mc.EXPECT().GetCollectionID(mock.Anything, mock.Anything, mock.Anything).Return(0, nil)
@@ -1471,7 +1487,7 @@ func TestProxy_ImportV2(t *testing.T) {
 		mc = NewMockCache(t)
 		mc.EXPECT().GetCollectionID(mock.Anything, mock.Anything, mock.Anything).Return(0, nil)
 		mc.EXPECT().GetCollectionSchema(mock.Anything, mock.Anything, mock.Anything).Return(&schemaInfo{
-			CollectionSchema: &schemapb.CollectionSchema{},
+			CollectionSchema: &schemapb.CollectionSchema{Fields: []*schemapb.FieldSchema{{FieldID: 1}}},
 		}, nil)
 		mc.EXPECT().GetPartitionID(mock.Anything, mock.Anything, mock.Anything, mock.Anything).Return(0, mockErr)
 		globalMetaCache = mc
@@ -1483,7 +1499,7 @@ func TestProxy_ImportV2(t *testing.T) {
 		mc = NewMockCache(t)
 		mc.EXPECT().GetCollectionID(mock.Anything, mock.Anything, mock.Anything).Return(0, nil)
 		mc.EXPECT().GetCollectionSchema(mock.Anything, mock.Anything, mock.Anything).Return(&schemaInfo{
-			CollectionSchema: &schemapb.CollectionSchema{},
+			CollectionSchema: &schemapb.CollectionSchema{Fields: []*schemapb.FieldSchema{{FieldID: 1}}},
 		}, nil)
 		mc.EXPECT().GetPartitionID(mock.Anything, mock.Anything, mock.Anything, mock.Anything).Return(0, nil)
 		globalMetaCache = mc
@@ -1504,16 +1520,23 @@ func TestProxy_ImportV2(t *testing.T) {
 		assert.NotEqual(t, int32(0), rsp.GetStatus().GetCode())
 
 		// normal case
-		rc := mocks.NewMockRootCoordClient(t)
-		rc.EXPECT().AllocID(mock.Anything, mock.Anything).Return(&rootcoordpb.AllocIDResponse{
-			ID:    rand.Int63(),
-			Count: 1,
-		}, nil).Once()
-		idAllocator, err := allocator.NewIDAllocator(ctx, rc, 0)
-		assert.NoError(t, err)
-		node.rowIDAllocator = idAllocator
-		err = idAllocator.Start()
-		assert.NoError(t, err)
+		mc = NewMockCache(t)
+		mc.EXPECT().GetCollectionID(mock.Anything, mock.Anything, mock.Anything).Return(0, nil)
+		mc.EXPECT().GetCollectionSchema(mock.Anything, mock.Anything, mock.Anything).Return(&schemaInfo{
+			CollectionSchema: &schemapb.CollectionSchema{Fields: []*schemapb.FieldSchema{{FieldID: 1}}},
+		}, nil)
+		mc.EXPECT().GetPartitionID(mock.Anything, mock.Anything, mock.Anything, mock.Anything).Return(int64(1), nil)
+		mc.EXPECT().GetDatabaseInfo(mock.Anything, mock.Anything).Return(&databaseInfo{
+			dbID: 1,
+		}, nil)
+		globalMetaCache = mc
+
+		mixCoord := mocks.NewMockMixCoordClient(t)
+		mixCoord.EXPECT().ImportV2(mock.Anything, mock.Anything).Return(&internalpb.ImportResponse{
+			Status: &commonpb.Status{ErrorCode: commonpb.ErrorCode_Success},
+			JobID:  "123456789",
+		}, nil)
+		node.mixCoord = mixCoord
 
 		rsp, err = node.ImportV2(ctx, &internalpb.ImportRequest{
 			CollectionName: "aaa",
@@ -1524,6 +1547,7 @@ func TestProxy_ImportV2(t *testing.T) {
 		})
 		assert.NoError(t, err)
 		assert.Equal(t, int32(0), rsp.GetStatus().GetCode())
+		assert.Equal(t, "123456789", rsp.GetJobID())
 	})
 
 	t.Run("GetImportProgress", func(t *testing.T) {
@@ -2456,4 +2480,129 @@ func TestProxy_GetReplicateConfiguration_Error(t *testing.T) {
 	assert.NoError(t, err)
 	assert.Error(t, merr.Error(resp.GetStatus()))
 	assert.Nil(t, resp.GetConfiguration())
+}
+
+func TestHybridSearchRequestExprLogger_String(t *testing.T) {
+	t.Run("empty requests", func(t *testing.T) {
+		logger := &hybridSearchRequestExprLogger{
+			req: &milvuspb.HybridSearchRequest{
+				Requests: []*milvuspb.SearchRequest{},
+			},
+		}
+		result := logger.String()
+		assert.Equal(t, "", result)
+	})
+
+	t.Run("single request", func(t *testing.T) {
+		logger := &hybridSearchRequestExprLogger{
+			req: &milvuspb.HybridSearchRequest{
+				Requests: []*milvuspb.SearchRequest{
+					{Dsl: "id > 100"},
+				},
+			},
+		}
+		result := logger.String()
+		assert.Equal(t, "[No.0 req, expr: id > 100]", result)
+	})
+
+	t.Run("multiple requests", func(t *testing.T) {
+		logger := &hybridSearchRequestExprLogger{
+			req: &milvuspb.HybridSearchRequest{
+				Requests: []*milvuspb.SearchRequest{
+					{Dsl: "id > 100"},
+					{Dsl: "name == 'test'"},
+					{Dsl: "age < 30"},
+				},
+			},
+		}
+		result := logger.String()
+		expected := "[No.0 req, expr: id > 100][No.1 req, expr: name == 'test'][No.2 req, expr: age < 30]"
+		assert.Equal(t, expected, result)
+	})
+
+	t.Run("request with empty dsl", func(t *testing.T) {
+		logger := &hybridSearchRequestExprLogger{
+			req: &milvuspb.HybridSearchRequest{
+				Requests: []*milvuspb.SearchRequest{
+					{Dsl: ""},
+				},
+			},
+		}
+		result := logger.String()
+		assert.Equal(t, "[No.0 req, expr: ]", result)
+	})
+
+	t.Run("nil sub request in slice", func(t *testing.T) {
+		logger := &hybridSearchRequestExprLogger{
+			req: &milvuspb.HybridSearchRequest{
+				Requests: []*milvuspb.SearchRequest{
+					nil,
+				},
+			},
+		}
+		result := logger.String()
+		assert.Equal(t, "[No.0 req, expr: ]", result)
+	})
+}
+
+func TestProxy_BatchUpdateManifest(t *testing.T) {
+	t.Run("unhealthy", func(t *testing.T) {
+		mockey.PatchConvey("TestProxy_BatchUpdateManifest_unhealthy", t, func() {
+			globalMetaCache = &MetaCache{}
+			mockey.Mock(globalMetaCache.GetCollectionID).To(func(ctx context.Context, dbName, collectionName string) (UniqueID, error) {
+				return UniqueID(0), nil
+			}).Build()
+			mockey.Mock(globalMetaCache.RemoveDatabase).To(func(ctx context.Context, dbName string) {}).Build()
+
+			mockey.Mock(paramtable.Init).Return().Build()
+			mockey.Mock((*paramtable.ComponentParam).Save).Return().Build()
+
+			node := createTestProxy()
+			defer node.sched.Close()
+
+			node.UpdateStateCode(commonpb.StateCode_Abnormal)
+			resp, err := node.BatchUpdateManifest(context.Background(), &milvuspb.BatchUpdateManifestRequest{
+				CollectionName: "test_collection",
+				Items: []*milvuspb.BatchUpdateManifestItem{
+					{SegmentId: 1, ManifestVersion: 10},
+				},
+			})
+
+			assert.NoError(t, err)
+			assert.ErrorIs(t, merr.Error(resp), merr.ErrServiceNotReady)
+		})
+	})
+
+	t.Run("success", func(t *testing.T) {
+		mockey.PatchConvey("TestProxy_BatchUpdateManifest_success", t, func() {
+			globalMetaCache = &MetaCache{}
+			mockey.Mock((*MetaCache).GetCollectionID).To(func(m *MetaCache, ctx context.Context, dbName, collectionName string) (UniqueID, error) {
+				return UniqueID(100), nil
+			}).Build()
+			mockey.Mock((*MetaCache).RemoveDatabase).To(func(m *MetaCache, ctx context.Context, dbName string) {}).Build()
+
+			mockey.Mock(paramtable.Init).Return().Build()
+			mockey.Mock((*paramtable.ComponentParam).Save).Return().Build()
+
+			node := createTestProxy()
+			defer node.sched.Close()
+
+			mixcoord := &grpcmixcoordclient.Client{}
+			node.mixCoord = mixcoord
+			mockey.Mock((*grpcmixcoordclient.Client).BatchUpdateManifest).To(func(c *grpcmixcoordclient.Client, ctx context.Context, req *datapb.BatchUpdateManifestRequest, opts ...grpc.CallOption) (*commonpb.Status, error) {
+				return merr.Success(), nil
+			}).Build()
+
+			resp, err := node.BatchUpdateManifest(context.Background(), &milvuspb.BatchUpdateManifestRequest{
+				CollectionName: "test_collection",
+				Items: []*milvuspb.BatchUpdateManifestItem{
+					{SegmentId: 1, ManifestVersion: 10},
+					{SegmentId: 2, ManifestVersion: 20},
+				},
+			})
+
+			assert.NoError(t, err)
+			assert.True(t, merr.Ok(resp))
+		})
+	})
 }

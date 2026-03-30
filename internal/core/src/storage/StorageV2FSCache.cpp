@@ -49,6 +49,10 @@ StorageV2FSCache::Get(const Key& key) {
     props[PROPERTY_FS_GCP_CREDENTIAL_JSON] = key.gcp_credential_json;
     props[PROPERTY_FS_USE_CUSTOM_PART_UPLOAD] = key.use_custom_part_upload;
     props[PROPERTY_FS_MAX_CONNECTIONS] = key.max_connections;
+    if (!key.tls_min_version.empty() && key.tls_min_version != "default") {
+        props[PROPERTY_FS_TLS_MIN_VERSION] = key.tls_min_version;
+    }
+    props[PROPERTY_FS_USE_CRC32C_CHECKSUM] = key.use_crc32c_checksum;
 
     LOG_INFO(
         "StorageV2FSCache::Get: address={}, bucket={}, root_path={}, "

@@ -40,6 +40,7 @@ import (
 	"github.com/milvus-io/milvus/internal/mocks"
 	"github.com/milvus-io/milvus/internal/proxy"
 	"github.com/milvus-io/milvus/internal/types"
+	"github.com/milvus-io/milvus/pkg/v2/common"
 	"github.com/milvus-io/milvus/pkg/v2/proto/internalpb"
 	"github.com/milvus-io/milvus/pkg/v2/util"
 	"github.com/milvus-io/milvus/pkg/v2/util/merr"
@@ -595,13 +596,17 @@ func TestDocInDocOutInsertInvalid(t *testing.T) {
 		ShardsNum:      ShardNumDefault,
 		Status:         &StatusSuccess,
 	}, nil).Once()
-	// invlaid insert request, will not be sent to proxy
+	// function output field data is now passed through to proxy for validation
+	insertErr := errors.Wrap(merr.ErrInvalidInsertData, "not allowed to provide data for BM25 function output field")
+	mp.EXPECT().Insert(mock.Anything, mock.Anything).Return(&milvuspb.MutationResult{
+		Status: merr.Status(insertErr),
+	}, nil).Once()
 
 	testcase := requestBodyTestCase{
 		path:        versionalV2(EntityCategory, InsertAction),
 		requestBody: []byte(`{"collectionName": "book", "data": [{"book_id": 0, "word_count": 0, "book_intro": {"1": 0.1}, "varchar_field": "some text"}]}`),
 		errCode:     1804,
-		errMsg:      "not allowed to provide input data for function output field",
+		errMsg:      "not allowed to provide data for BM25 function output field",
 	}
 
 	sendReqAndVerify(t, testEngine, testcase.path, http.MethodPost, testcase)
@@ -1171,6 +1176,46 @@ func TestIndexProperties(t *testing.T) {
 	}
 }
 
+func TestDescribeIndexWithWarmup(t *testing.T) {
+	paramtable.Init()
+	// disable rate limit
+	paramtable.Get().Save(paramtable.Get().QuotaConfig.QuotaAndLimitsEnabled.Key, "false")
+	defer paramtable.Get().Reset(paramtable.Get().QuotaConfig.QuotaAndLimitsEnabled.Key)
+
+	mp := mocks.NewMockProxy(t)
+	mp.EXPECT().DescribeIndex(mock.Anything, mock.Anything).Return(&milvuspb.DescribeIndexResponse{
+		Status: &StatusSuccess,
+		IndexDescriptions: []*milvuspb.IndexDescription{
+			{
+				IndexName: DefaultIndexName,
+				FieldName: FieldBookIntro,
+				Params: []*commonpb.KeyValuePair{
+					{Key: common.MetricTypeKey, Value: DefaultMetricType},
+					{Key: common.IndexTypeKey, Value: "IVF_FLAT"},
+					{Key: common.WarmupKey, Value: "sync"},
+				},
+				State: commonpb.IndexState_Finished,
+			},
+		},
+	}, nil).Once()
+	testEngine := initHTTPServerV2(mp, false)
+
+	req := httptest.NewRequest(http.MethodPost, versionalV2(IndexCategory, DescribeAction),
+		bytes.NewReader([]byte(`{"collectionName": "`+DefaultCollectionName+`", "indexName": "`+DefaultIndexName+`"}`)))
+	w := httptest.NewRecorder()
+	testEngine.ServeHTTP(w, req)
+	assert.Equal(t, http.StatusOK, w.Code)
+
+	var resp map[string]any
+	err := json.Unmarshal(w.Body.Bytes(), &resp)
+	assert.Nil(t, err)
+	assert.Equal(t, float64(0), resp["code"])
+	data := resp["data"].([]any)
+	assert.Equal(t, 1, len(data))
+	indexInfo := data[0].(map[string]any)
+	assert.Equal(t, "sync", indexInfo["warmup"])
+}
+
 func TestCollectionFieldProperties(t *testing.T) {
 	paramtable.Init()
 	// disable rate limit
@@ -1517,6 +1562,40 @@ func TestCreateCollection(t *testing.T) {
 			}
 		})
 	}
+
+	// collection-level warmup params: assert Properties contains the 4 warmup key-value pairs
+	t.Run("warmup properties in CreateCollectionRequest", func(t *testing.T) {
+		mp2 := mocks.NewMockProxy(t)
+		mp2.EXPECT().CreateCollection(mock.Anything, mock.MatchedBy(func(req *milvuspb.CreateCollectionRequest) bool {
+			warmupProps := make(map[string]string)
+			for _, kv := range req.Properties {
+				warmupProps[kv.Key] = kv.Value
+			}
+			return warmupProps[common.WarmupScalarFieldKey] == "sync" &&
+				warmupProps[common.WarmupScalarIndexKey] == "sync" &&
+				warmupProps[common.WarmupVectorFieldKey] == "sync" &&
+				warmupProps[common.WarmupVectorIndexKey] == "disable"
+		})).Return(commonSuccessStatus, nil).Once()
+		mp2.EXPECT().CreateIndex(mock.Anything, mock.Anything).Return(commonSuccessStatus, nil).Once()
+		mp2.EXPECT().LoadCollection(mock.Anything, mock.Anything).Return(commonSuccessStatus, nil).Once()
+		testEngine2 := initHTTPServerV2(mp2, false)
+
+		reqBody := []byte(`{"collectionName": "` + DefaultCollectionName + `", "schema": {
+		        "fields": [
+		            {"fieldName": "book_id", "dataType": "Int64", "isPrimary": true, "elementTypeParams": {}},
+		            {"fieldName": "book_intro", "dataType": "FloatVector", "elementTypeParams": {"dim": 2}}
+		        ]
+		    }, "indexParams": [{"fieldName": "book_intro", "indexName": "book_intro_vector", "metricType": "L2"}],
+		    "params": {"warmup.scalarField": "sync", "warmup.scalarIndex": "sync", "warmup.vectorField": "sync", "warmup.vectorIndex": "disable"}}`)
+		req := httptest.NewRequest(http.MethodPost, path, bytes.NewReader(reqBody))
+		w := httptest.NewRecorder()
+		testEngine2.ServeHTTP(w, req)
+		assert.Equal(t, http.StatusOK, w.Code)
+		returnBody := &ReturnErrMsg{}
+		err := json.Unmarshal(w.Body.Bytes(), returnBody)
+		assert.Nil(t, err)
+		assert.Equal(t, int32(0), returnBody.Code)
+	})
 }
 
 func versionalV2(category string, action string) string {

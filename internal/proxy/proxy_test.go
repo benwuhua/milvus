@@ -42,7 +42,6 @@ import (
 	"github.com/milvus-io/milvus-proto/go-api/v2/commonpb"
 	"github.com/milvus-io/milvus-proto/go-api/v2/milvuspb"
 	"github.com/milvus-io/milvus-proto/go-api/v2/schemapb"
-	"github.com/milvus-io/milvus/internal/allocator"
 	grpcdatanode "github.com/milvus-io/milvus/internal/distributed/datanode"
 	grpcmixcoord "github.com/milvus-io/milvus/internal/distributed/mixcoord"
 	mixc "github.com/milvus-io/milvus/internal/distributed/mixcoord/client"
@@ -212,6 +211,7 @@ type proxyTestServer struct {
 	*Proxy
 	grpcServer *grpc.Server
 	ch         chan error
+	lisAddr    string // actual listen address (set after startGrpc binds to :0)
 }
 
 func newProxyTestServer(node *Proxy) *proxyTestServer {
@@ -251,14 +251,15 @@ func (s *proxyTestServer) startGrpc(ctx context.Context, p *paramtable.GrpcServe
 		Timeout: 10 * time.Second, // Wait 10 second for the ping ack before assuming the connection is dead
 	}
 
-	log.Debug("Proxy server listen on tcp", zap.Int("port", p.Port.GetAsInt()))
-	lis, err := net.Listen("tcp", ":"+p.Port.GetValue())
+	log.Debug("Proxy server about to listen on localhost:0")
+	lis, err := net.Listen("tcp", "localhost:0")
 	if err != nil {
-		log.Warn("Proxy server failed to listen on", zap.Error(err), zap.Int("port", p.Port.GetAsInt()))
+		log.Warn("Proxy server failed to listen on", zap.Error(err))
 		s.ch <- err
 		return
 	}
-	log.Debug("Proxy server already listen on tcp", zap.Int("port", p.Port.GetAsInt()))
+	s.lisAddr = lis.Addr().String()
+	log.Debug("Proxy server listening on", zap.String("addr", s.lisAddr))
 
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
@@ -984,11 +985,11 @@ func TestProxy(t *testing.T) {
 	base.Init(bt)
 	var p paramtable.GrpcServerConfig
 	p.Init(typeutil.ProxyRole, bt)
-	testServer.Proxy.SetAddress(p.GetAddress())
-	assert.Equal(t, p.GetAddress(), testServer.Proxy.GetAddress())
 
 	go testServer.startGrpc(ctx, &p)
 	assert.NoError(t, testServer.waitForGrpcReady())
+	testServer.Proxy.SetAddress(testServer.lisAddr)
+	assert.Equal(t, testServer.lisAddr, testServer.Proxy.GetAddress())
 
 	rootCoordClient, err := mixc.NewClient(ctx)
 	assert.NoError(t, err)
@@ -4284,25 +4285,25 @@ func TestProxy_Import(t *testing.T) {
 		mc := NewMockCache(t)
 		mc.EXPECT().GetCollectionID(mock.Anything, mock.Anything, mock.Anything).Return(0, nil)
 		mc.EXPECT().GetCollectionSchema(mock.Anything, mock.Anything, mock.Anything).Return(&schemaInfo{
-			CollectionSchema: &schemapb.CollectionSchema{},
+			CollectionSchema: &schemapb.CollectionSchema{Fields: []*schemapb.FieldSchema{{FieldID: 1}}},
 		}, nil)
 		mc.EXPECT().GetPartitionID(mock.Anything, mock.Anything, mock.Anything, mock.Anything).Return(0, nil)
+		mc.EXPECT().GetDatabaseInfo(mock.Anything, mock.Anything).Return(&databaseInfo{
+			dbID: 1,
+		}, nil)
 		globalMetaCache = mc
 
 		chMgr := NewMockChannelsMgr(t)
 		chMgr.EXPECT().getVChannels(mock.Anything).Return([]string{"foo"}, nil)
 		proxy.chMgr = chMgr
 
-		rc := mocks.NewMockRootCoordClient(t)
-		rc.EXPECT().AllocID(mock.Anything, mock.Anything).Return(&rootcoordpb.AllocIDResponse{
-			ID:    rand.Int63(),
-			Count: 1,
-		}, nil).Once()
-		idAllocator, err := allocator.NewIDAllocator(ctx, rc, 0)
-		assert.NoError(t, err)
-		err = idAllocator.Start()
-		assert.NoError(t, err)
-		proxy.rowIDAllocator = idAllocator
+		mixCoord := mocks.NewMockMixCoordClient(t)
+		mixCoord.EXPECT().ImportV2(mock.Anything, mock.Anything).Return(&internalpb.ImportResponse{
+			Status: &commonpb.Status{ErrorCode: commonpb.ErrorCode_Success},
+			JobID:  "123456789",
+		}, nil)
+		proxy.mixCoord = mixCoord
+
 		proxy.tsoAllocator = &timestampAllocator{
 			tso: newMockTimestampAllocatorInterface(),
 		}

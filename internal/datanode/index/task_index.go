@@ -121,8 +121,8 @@ func (it *indexBuildTask) Name() string {
 func (it *indexBuildTask) SetState(state indexpb.JobState, failReason string) {
 	it.manager.StoreIndexTaskState(it.req.GetClusterID(), it.req.GetBuildID(), commonpb.IndexState(state), failReason)
 	if state == indexpb.JobState_JobStateFinished {
-		metrics.DataNodeBuildIndexLatency.WithLabelValues(fmt.Sprint(paramtable.GetNodeID())).Observe(it.tr.ElapseSpan().Seconds())
-		metrics.DataNodeIndexTaskLatencyInQueue.WithLabelValues(fmt.Sprint(paramtable.GetNodeID())).Observe(float64(it.queueDur.Milliseconds()))
+		metrics.DataNodeBuildIndexLatency.WithLabelValues(paramtable.GetStringNodeID()).Observe(it.tr.ElapseSpan().Seconds())
+		metrics.DataNodeIndexTaskLatencyInQueue.WithLabelValues(paramtable.GetStringNodeID()).Observe(float64(it.queueDur.Milliseconds()))
 	}
 }
 
@@ -214,7 +214,7 @@ func (it *indexBuildTask) PreExecute(ctx context.Context) error {
 	}
 
 	it.req.CurrentIndexVersion = getCurrentIndexVersion(it.req.GetCurrentIndexVersion())
-	it.req.CurrentScalarIndexVersion = getCurrentScalarIndexVersion(it.req.GetCurrentScalarIndexVersion())
+	it.req.CurrentScalarIndexVersion = common.ClampScalarIndexVersion(it.req.GetCurrentScalarIndexVersion())
 
 	log.Ctx(ctx).Info("Successfully prepare indexBuildTask", zap.Int64("buildID", it.req.GetBuildID()),
 		zap.Int64("collectionID", it.req.GetCollectionID()), zap.Int64("segmentID", it.req.GetSegmentID()),
@@ -268,6 +268,8 @@ func (it *indexBuildTask) Execute(ctx context.Context) error {
 		RequestTimeoutMs:  it.req.GetStorageConfig().GetRequestTimeoutMs(),
 		SslCACert:         it.req.GetStorageConfig().GetSslCACert(),
 		GcpCredentialJSON: it.req.GetStorageConfig().GetGcpCredentialJSON(),
+		SslTlsMinVersion:  it.req.GetStorageConfig().GetSslTlsMinVersion(),
+		UseCrc32CChecksum: it.req.GetStorageConfig().GetUseCrc32CChecksum(),
 	}
 
 	optFields := make([]*indexcgopb.OptionalFieldInfo, 0, len(it.req.GetOptionalScalarFields()))

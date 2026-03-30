@@ -1192,6 +1192,11 @@ func (s *Server) CreateReplicateStream(stream milvuspb.MilvusService_CreateRepli
 	return s.proxy.CreateReplicateStream(stream)
 }
 
+// DumpMessages streams messages from a WAL range for data salvage.
+func (s *Server) DumpMessages(req *milvuspb.DumpMessagesRequest, stream milvuspb.MilvusService_DumpMessagesServer) error {
+	return s.proxy.DumpMessages(req, stream)
+}
+
 // ComputePhraseMatchSlop computes the minimum slop required for phrase matching.
 func (s *Server) ComputePhraseMatchSlop(ctx context.Context, req *milvuspb.ComputePhraseMatchSlopRequest) (*milvuspb.ComputePhraseMatchSlopResponse, error) {
 	return s.proxy.ComputePhraseMatchSlop(ctx, req)
@@ -1243,4 +1248,20 @@ func (s *Server) PushClientCommand(ctx context.Context, req *milvuspb.PushClient
 // DeleteClientCommand deletes a client command
 func (s *Server) DeleteClientCommand(ctx context.Context, req *milvuspb.DeleteClientCommandRequest) (*milvuspb.DeleteClientCommandResponse, error) {
 	return s.proxy.DeleteClientCommand(ctx, req)
+}
+
+func (s *Server) BatchUpdateManifest(ctx context.Context, req *milvuspb.BatchUpdateManifestRequest) (*commonpb.Status, error) {
+	return s.proxy.BatchUpdateManifest(ctx, req)
+}
+
+func (s *Server) RefreshExternalCollection(ctx context.Context, req *milvuspb.RefreshExternalCollectionRequest) (*milvuspb.RefreshExternalCollectionResponse, error) {
+	return s.proxy.RefreshExternalCollection(ctx, req)
+}
+
+func (s *Server) GetRefreshExternalCollectionProgress(ctx context.Context, req *milvuspb.GetRefreshExternalCollectionProgressRequest) (*milvuspb.GetRefreshExternalCollectionProgressResponse, error) {
+	return s.proxy.GetRefreshExternalCollectionProgress(ctx, req)
+}
+
+func (s *Server) ListRefreshExternalCollectionJobs(ctx context.Context, req *milvuspb.ListRefreshExternalCollectionJobsRequest) (*milvuspb.ListRefreshExternalCollectionJobsResponse, error) {
+	return s.proxy.ListRefreshExternalCollectionJobs(ctx, req)
 }

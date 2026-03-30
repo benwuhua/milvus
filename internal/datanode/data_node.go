@@ -168,7 +168,7 @@ func (node *DataNode) initSession() error {
 	if node.session == nil {
 		return errors.New("failed to initialize session")
 	}
-	node.session.Init(typeutil.DataNodeRole, node.address, false, true)
+	node.session.Init(typeutil.DataNodeRole, node.address, false)
 	sessionutil.SaveServerInfo(typeutil.DataNodeRole, node.session.ServerID)
 	return nil
 }
@@ -319,6 +319,8 @@ func (node *DataNode) Stop() error {
 		}
 
 		index.CloseSegcore()
+
+		metrics.CleanupDataNodeCompactionMetrics(paramtable.GetNodeID())
 
 		// Delay the cancellation of ctx to ensure that the session is automatically recycled after closed the flow graph
 		node.cancel()

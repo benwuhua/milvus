@@ -1130,6 +1130,7 @@ func convertModelToDesc(collInfo *model.Collection, aliases []string, dbName str
 		StructArrayFields:  model.MarshalStructArrayFieldModels(collInfo.StructArrayFields),
 		Functions:          model.MarshalFunctionModels(collInfo.Functions),
 		EnableDynamicField: collInfo.EnableDynamicField,
+		EnableNamespace:    collInfo.EnableNamespace,
 		Properties:         collInfo.Properties,
 		FileResourceIds:    collInfo.FileResourceIds,
 		ExternalSource:     collInfo.ExternalSource,
@@ -1495,6 +1496,29 @@ func (c *Core) AlterCollectionField(ctx context.Context, in *milvuspb.AlterColle
 	metrics.RootCoordDDLReqLatency.WithLabelValues("AlterCollectionField").Observe(float64(tr.ElapseSpan().Milliseconds()))
 	log.Info("done to alter collection field")
 	return merr.Success(), nil
+}
+
+func (c *Core) AlterCollectionSchema(ctx context.Context, in *milvuspb.AlterCollectionSchemaRequest) (*milvuspb.AlterCollectionSchemaResponse, error) {
+	if err := merr.CheckHealthy(c.GetStateCode()); err != nil {
+		return &milvuspb.AlterCollectionSchemaResponse{}, nil
+	}
+
+	metrics.RootCoordDDLReqCounter.WithLabelValues("AlterCollectionSchema", metrics.TotalLabel).Inc()
+	tr := timerecord.NewTimeRecorder("AlterCollectionSchema")
+
+	log := log.Ctx(ctx).With(zap.String("role", typeutil.RootCoordRole),
+		zap.String("dbName", in.GetDbName()),
+		zap.String("collectionName", in.GetCollectionName()),
+	)
+	log.Info("received request to alter collection schema")
+
+	// AlterCollectionSchema is currently a placeholder implementation
+	// The actual logic should handle schema alterations similar to AlterCollection
+	// For now, return success to satisfy the interface
+	metrics.RootCoordDDLReqCounter.WithLabelValues("AlterCollectionSchema", metrics.SuccessLabel).Inc()
+	metrics.RootCoordDDLReqLatency.WithLabelValues("AlterCollectionSchema").Observe(float64(tr.ElapseSpan().Milliseconds()))
+	log.Info("done to alter collection schema")
+	return &milvuspb.AlterCollectionSchemaResponse{}, nil
 }
 
 func (c *Core) AlterDatabase(ctx context.Context, in *rootcoordpb.AlterDatabaseRequest) (*commonpb.Status, error) {
@@ -3077,13 +3101,20 @@ func (c *Core) ListFileResources(ctx context.Context, req *milvuspb.ListFileReso
 		}, nil
 	}
 
+	resources, _ := c.meta.ListFileResource(ctx)
 	ctxLog.Debug(method + " success")
 	metrics.RootCoordDDLReqCounter.WithLabelValues(method, metrics.SuccessLabel).Inc()
 	metrics.RootCoordDDLReqLatency.WithLabelValues(method).Observe(float64(tr.ElapseSpan().Milliseconds()))
 
 	return &milvuspb.ListFileResourcesResponse{
-		Status:    merr.Success(),
-		Resources: []*milvuspb.FileResourceInfo{},
+		Status: merr.Success(),
+		Resources: lo.Map(resources, func(resource *internalpb.FileResourceInfo, _ int) *milvuspb.FileResourceInfo {
+			return &milvuspb.FileResourceInfo{
+				Id:   resource.Id,
+				Name: resource.Name,
+				Path: resource.Path,
+			}
+		}),
 	}, nil
 }
 

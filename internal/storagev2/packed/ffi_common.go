@@ -38,6 +38,9 @@ const (
 	PropertyFSRequestTimeoutMS    = "fs.request_timeout_ms"
 	PropertyFSGCPCredentialJSON   = "fs.gcp_credential_json"
 	PropertyFSUseCustomPartUpload = "fs.use_custom_part_upload"
+	PropertyFSMaxConnections      = "fs.max_connections"
+	PropertyFSTLSMinVersion       = "fs.tls_min_version"
+	PropertyFSUseCRC32CChecksum   = "fs.use_crc32c_checksum"
 
 	PropertyWriterPolicy             = "writer.policy"
 	PropertyWriterSchemaBasedPattern = "writer.split.schema_based.patterns"
@@ -140,6 +143,70 @@ func MakePropertiesFromStorageConfig(storageConfig *indexpb.StorageConfig, extra
 	keys = append(keys, PropertyFSRequestTimeoutMS)
 	values = append(values, strconv.FormatInt(storageConfig.GetRequestTimeoutMs(), 10))
 
+	// Add TLS min version (skip "default" — consistent with C++ layer filtering)
+	if v := storageConfig.GetSslTlsMinVersion(); v != "" && v != "default" {
+		keys = append(keys, PropertyFSTLSMinVersion)
+		values = append(values, v)
+	}
+
+	// Add CRC32C checksum
+	keys = append(keys, PropertyFSUseCRC32CChecksum)
+	if storageConfig.GetUseCrc32CChecksum() {
+		values = append(values, "true")
+	} else {
+		values = append(values, "false")
+	}
+
+	// Add extfs.default.* properties (mirrors string fields from fs.* with extfs.default.* prefix)
+	const extfsPrefix = "extfs.default."
+	if storageConfig.GetStorageType() != "" {
+		keys = append(keys, extfsPrefix+"storage_type")
+		values = append(values, storageConfig.GetStorageType())
+	}
+	if storageConfig.GetStorageType() == "local" {
+		keys = append(keys, extfsPrefix+"bucket_name")
+		values = append(values, "local")
+	} else if storageConfig.GetBucketName() != "" {
+		keys = append(keys, extfsPrefix+"bucket_name")
+		values = append(values, storageConfig.GetBucketName())
+	}
+	if storageConfig.GetAddress() != "" {
+		keys = append(keys, extfsPrefix+"address")
+		values = append(values, storageConfig.GetAddress())
+	}
+	if storageConfig.GetRootPath() != "" {
+		keys = append(keys, extfsPrefix+"root_path")
+		values = append(values, storageConfig.GetRootPath())
+	}
+	if storageConfig.GetAccessKeyID() != "" {
+		keys = append(keys, extfsPrefix+"access_key_id")
+		values = append(values, storageConfig.GetAccessKeyID())
+	}
+	if storageConfig.GetSecretAccessKey() != "" {
+		keys = append(keys, extfsPrefix+"access_key_value")
+		values = append(values, storageConfig.GetSecretAccessKey())
+	}
+	if storageConfig.GetCloudProvider() != "" {
+		keys = append(keys, extfsPrefix+"cloud_provider")
+		values = append(values, storageConfig.GetCloudProvider())
+	}
+	if storageConfig.GetIAMEndpoint() != "" {
+		keys = append(keys, extfsPrefix+"iam_endpoint")
+		values = append(values, storageConfig.GetIAMEndpoint())
+	}
+	if storageConfig.GetRegion() != "" {
+		keys = append(keys, extfsPrefix+"region")
+		values = append(values, storageConfig.GetRegion())
+	}
+	if storageConfig.GetSslCACert() != "" {
+		keys = append(keys, extfsPrefix+"ssl_ca_cert")
+		values = append(values, storageConfig.GetSslCACert())
+	}
+	if storageConfig.GetGcpCredentialJSON() != "" {
+		keys = append(keys, extfsPrefix+"gcp_credential_json")
+		values = append(values, storageConfig.GetGcpCredentialJSON())
+	}
+
 	// Add extra kvs
 	for k, v := range extraKVs {
 		keys = append(keys, k)
@@ -184,6 +251,13 @@ func MakePropertiesFromStorageConfig(storageConfig *indexpb.StorageConfig, extra
 	return properties, nil
 }
 
+// FreeProperties releases a C-allocated LoonProperties object.
+func FreeProperties(props *C.LoonProperties) {
+	if props != nil {
+		C.loon_properties_free(props)
+	}
+}
+
 func HandleLoonFFIResult(ffiResult C.LoonFFIResult) error {
 	defer C.loon_ffi_free_result(&ffiResult)
 	if C.loon_ffi_is_success(&ffiResult) == 0 {
@@ -193,7 +267,7 @@ func HandleLoonFFIResult(ffiResult C.LoonFFIResult) error {
 			errStr = C.GoString(errMsg)
 		}
 
-		return fmt.Errorf("failed to create properties: %s", errStr)
+		return fmt.Errorf("FFI operation failed: %s", errStr)
 	}
 	return nil
 }
@@ -204,18 +278,58 @@ type ManifestJSON struct {
 }
 
 func MarshalManifestPath(basePath string, version int64) string {
-	bs, _ := json.Marshal(ManifestJSON{
+	bs, err := json.Marshal(ManifestJSON{
 		ManifestVersion: version,
 		BasePath:        basePath,
 	})
+	if err != nil {
+		// json.Marshal on string+int64 struct should never fail, but log if it does
+		return fmt.Sprintf(`{"ver":%d,"base_path":"%s"}`, version, basePath)
+	}
 	return string(bs)
 }
 
-func UnmarshalManfestPath(manifestPath string) (string, int64, error) {
+func UnmarshalManifestPath(manifestPath string) (string, int64, error) {
 	var manifestJSON ManifestJSON
 	err := json.Unmarshal([]byte(manifestPath), &manifestJSON)
 	if err != nil {
 		return "", 0, err
 	}
 	return manifestJSON.BasePath, manifestJSON.ManifestVersion, nil
+}
+
+// CompareManifestPath compares two manifest paths by their version.
+// Returns:
+//
+//	-1 if a < b (a is older)
+//	 0 if a == b (same version or both empty)
+//	 1 if a > b (a is newer)
+//	 error if the paths are not comparable (parse failure or different base paths)
+func CompareManifestPath(a, b string) (int, error) {
+	if a == b {
+		return 0, nil
+	}
+
+	aBase, aVer, aErr := UnmarshalManifestPath(a)
+	bBase, bVer, bErr := UnmarshalManifestPath(b)
+
+	if aErr != nil {
+		return 0, fmt.Errorf("failed to parse manifest path %q: %w", a, aErr)
+	}
+	if bErr != nil {
+		return 0, fmt.Errorf("failed to parse manifest path %q: %w", b, bErr)
+	}
+
+	if aBase != bBase {
+		return 0, fmt.Errorf("manifest paths have different base paths: %q vs %q", aBase, bBase)
+	}
+
+	switch {
+	case aVer < bVer:
+		return -1, nil
+	case aVer > bVer:
+		return 1, nil
+	default:
+		return 0, nil
+	}
 }

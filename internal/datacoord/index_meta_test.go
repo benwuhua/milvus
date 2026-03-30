@@ -45,16 +45,17 @@ func TestReloadFromKV(t *testing.T) {
 	t.Run("ListIndexes_fail", func(t *testing.T) {
 		catalog := catalogmocks.NewDataCoordCatalog(t)
 		catalog.EXPECT().ListIndexes(mock.Anything).Return(nil, errors.New("mock"))
-		_, err := newIndexMeta(context.TODO(), catalog)
+		catalog.EXPECT().ListSegmentIndexes(mock.Anything, mock.Anything).Return(nil, nil).Maybe()
+		_, err := newIndexMeta(context.TODO(), catalog, []int64{0})
 		assert.Error(t, err)
 	})
 
 	t.Run("ListSegmentIndexes_fails", func(t *testing.T) {
 		catalog := catalogmocks.NewDataCoordCatalog(t)
 		catalog.EXPECT().ListIndexes(mock.Anything).Return([]*model.Index{}, nil)
-		catalog.EXPECT().ListSegmentIndexes(mock.Anything).Return(nil, errors.New("mock"))
+		catalog.EXPECT().ListSegmentIndexes(mock.Anything, mock.Anything).Return(nil, errors.New("mock"))
 
-		_, err := newIndexMeta(context.TODO(), catalog)
+		_, err := newIndexMeta(context.TODO(), catalog, []int64{0})
 		assert.Error(t, err)
 	})
 
@@ -69,14 +70,14 @@ func TestReloadFromKV(t *testing.T) {
 			},
 		}, nil)
 
-		catalog.EXPECT().ListSegmentIndexes(mock.Anything).Return([]*model.SegmentIndex{
+		catalog.EXPECT().ListSegmentIndexes(mock.Anything, mock.Anything).Return([]*model.SegmentIndex{
 			{
 				SegmentID: 1,
 				IndexID:   1,
 			},
 		}, nil)
 
-		meta, err := newIndexMeta(context.TODO(), catalog)
+		meta, err := newIndexMeta(context.TODO(), catalog, []int64{0})
 		assert.NoError(t, err)
 		assert.NotNil(t, meta)
 	})
@@ -815,6 +816,35 @@ func TestMeta_GetIndexedSegment(t *testing.T) {
 	t.Run("no index", func(t *testing.T) {
 		segments := m.GetIndexedSegments(collID+1, []int64{segID}, []int64{fieldID})
 		assert.Len(t, segments, 0)
+	})
+
+	t.Run("with deleted index entries", func(t *testing.T) {
+		// Simulate drop+create index cycles: add deleted index entries for the same field.
+		// Previously, deleted entries inflated len(targetIndices), causing the indexed check
+		// to always fail (indexedFields=1 != len(targetIndices)=N).
+		deletedIndexID1 := indexID + 100
+		deletedIndexID2 := indexID + 200
+		m.indexes[collID][deletedIndexID1] = &model.Index{
+			CollectionID: collID,
+			FieldID:      fieldID,
+			IndexID:      deletedIndexID1,
+			IndexName:    "old_idx_1",
+			IsDeleted:    true,
+		}
+		m.indexes[collID][deletedIndexID2] = &model.Index{
+			CollectionID: collID,
+			FieldID:      fieldID,
+			IndexID:      deletedIndexID2,
+			IndexName:    "old_idx_2",
+			IsDeleted:    true,
+		}
+
+		segments := m.GetIndexedSegments(collID, []int64{segID}, []int64{fieldID})
+		assert.Len(t, segments, 1, "segment should be indexed even with deleted index entries")
+
+		// Cleanup
+		delete(m.indexes[collID], deletedIndexID1)
+		delete(m.indexes[collID], deletedIndexID2)
 	})
 }
 
@@ -1609,6 +1639,54 @@ func TestBuildIndexTaskStatsJSON(t *testing.T) {
 	assert.Equal(t, 1, len(im.segmentBuildInfo.List()))
 }
 
+func TestSegmentBuildInfo_AddForRecovery(t *testing.T) {
+	t.Run("lru not full, all states inserted", func(t *testing.T) {
+		info := newSegmentIndexBuildInfo()
+		finished := &model.SegmentIndex{BuildID: 1, IndexState: commonpb.IndexState_Finished}
+		inProgress := &model.SegmentIndex{BuildID: 2, IndexState: commonpb.IndexState_InProgress}
+
+		info.AddForRecovery(finished)
+		info.AddForRecovery(inProgress)
+
+		assert.Equal(t, 2, len(info.List()))
+		assert.Equal(t, 2, len(info.GetTaskStats()))
+	})
+
+	t.Run("lru full, finished tasks skipped", func(t *testing.T) {
+		info := newSegmentIndexBuildInfo()
+		// Fill the LRU to capacity with in-progress tasks.
+		for i := int64(0); i < taskStatsLRUCapacity; i++ {
+			info.AddForRecovery(&model.SegmentIndex{BuildID: i, IndexState: commonpb.IndexState_InProgress})
+		}
+		assert.Equal(t, taskStatsLRUCapacity, info.taskStats.Len())
+
+		// A finished task should be skipped when LRU is full.
+		finished := &model.SegmentIndex{BuildID: taskStatsLRUCapacity + 1, IndexState: commonpb.IndexState_Finished}
+		info.AddForRecovery(finished)
+
+		_, ok := info.Get(finished.BuildID)
+		assert.True(t, ok, "buildID2SegmentIndex should still contain the entry")
+		assert.Equal(t, taskStatsLRUCapacity, info.taskStats.Len(), "LRU size should not grow")
+	})
+
+	t.Run("lru full, unfinished tasks still inserted", func(t *testing.T) {
+		info := newSegmentIndexBuildInfo()
+		for i := int64(0); i < taskStatsLRUCapacity; i++ {
+			info.AddForRecovery(&model.SegmentIndex{BuildID: i, IndexState: commonpb.IndexState_InProgress})
+		}
+		assert.Equal(t, taskStatsLRUCapacity, info.taskStats.Len())
+
+		// An unfinished task should still be inserted (evicting the oldest).
+		unissued := &model.SegmentIndex{BuildID: taskStatsLRUCapacity + 1, IndexState: commonpb.IndexState_Unissued}
+		info.AddForRecovery(unissued)
+
+		_, ok := info.Get(unissued.BuildID)
+		assert.True(t, ok)
+		// LRU size stays at capacity because the oldest entry was evicted.
+		assert.Equal(t, taskStatsLRUCapacity, info.taskStats.Len())
+	})
+}
+
 func TestMeta_GetIndexJSON(t *testing.T) {
 	m := &indexMeta{
 		indexes: map[UniqueID]map[UniqueID]*model.Index{
@@ -1714,5 +1792,126 @@ func TestMeta_GetSegmentIndexStatus(t *testing.T) {
 		isIndexed, segmentIndexes := m.GetSegmentIndexedFields(collID, segID+1)
 		assert.False(t, isIndexed)
 		assert.Empty(t, segmentIndexes)
+	})
+}
+
+func TestCheckParams(t *testing.T) {
+	t.Run("same params without warmup", func(t *testing.T) {
+		fieldIndex := &model.Index{
+			TypeParams: []*commonpb.KeyValuePair{
+				{Key: common.DimKey, Value: "128"},
+			},
+			UserIndexParams: []*commonpb.KeyValuePair{
+				{Key: common.MetricTypeKey, Value: "L2"},
+				{Key: common.IndexTypeKey, Value: "HNSW"},
+			},
+		}
+		req := &indexpb.CreateIndexRequest{
+			TypeParams: []*commonpb.KeyValuePair{
+				{Key: common.DimKey, Value: "128"},
+			},
+			UserIndexParams: []*commonpb.KeyValuePair{
+				{Key: common.MetricTypeKey, Value: "L2"},
+				{Key: common.IndexTypeKey, Value: "HNSW"},
+			},
+		}
+		assert.True(t, checkParams(fieldIndex, req))
+	})
+
+	t.Run("same params with warmup in request only", func(t *testing.T) {
+		// This test verifies the fix for the idempotency bug
+		// When index is created, WarmupKey is removed from stored TypeParams
+		// But when checking idempotency, WarmupKey should also be ignored in request
+		fieldIndex := &model.Index{
+			TypeParams: []*commonpb.KeyValuePair{
+				{Key: common.DimKey, Value: "128"},
+				// Note: WarmupKey is NOT in stored TypeParams because it was removed during CreateIndex
+			},
+			UserIndexParams: []*commonpb.KeyValuePair{
+				{Key: common.MetricTypeKey, Value: "L2"},
+				{Key: common.IndexTypeKey, Value: "HNSW"},
+			},
+		}
+		req := &indexpb.CreateIndexRequest{
+			TypeParams: []*commonpb.KeyValuePair{
+				{Key: common.DimKey, Value: "128"},
+				{Key: common.WarmupKey, Value: "sync"}, // WarmupKey in request should be ignored
+			},
+			UserIndexParams: []*commonpb.KeyValuePair{
+				{Key: common.MetricTypeKey, Value: "L2"},
+				{Key: common.IndexTypeKey, Value: "HNSW"},
+			},
+		}
+		// Before fix: this would return false because len(metaTypeParams) != len(reqTypeParams)
+		// After fix: this should return true because WarmupKey is filtered from both
+		assert.True(t, checkParams(fieldIndex, req))
+	})
+
+	t.Run("same params with warmup in different order", func(t *testing.T) {
+		fieldIndex := &model.Index{
+			TypeParams: []*commonpb.KeyValuePair{
+				{Key: common.DimKey, Value: "128"},
+			},
+			UserIndexParams: []*commonpb.KeyValuePair{
+				{Key: common.MetricTypeKey, Value: "L2"},
+				{Key: common.IndexTypeKey, Value: "HNSW"},
+			},
+		}
+		req := &indexpb.CreateIndexRequest{
+			TypeParams: []*commonpb.KeyValuePair{
+				{Key: common.WarmupKey, Value: "sync"},
+				{Key: common.DimKey, Value: "128"},
+			},
+			UserIndexParams: []*commonpb.KeyValuePair{
+				{Key: common.IndexTypeKey, Value: "HNSW"},
+				{Key: common.MetricTypeKey, Value: "L2"},
+			},
+		}
+		assert.True(t, checkParams(fieldIndex, req))
+	})
+
+	t.Run("different params", func(t *testing.T) {
+		fieldIndex := &model.Index{
+			TypeParams: []*commonpb.KeyValuePair{
+				{Key: common.DimKey, Value: "128"},
+			},
+			UserIndexParams: []*commonpb.KeyValuePair{
+				{Key: common.MetricTypeKey, Value: "L2"},
+				{Key: common.IndexTypeKey, Value: "HNSW"},
+			},
+		}
+		req := &indexpb.CreateIndexRequest{
+			TypeParams: []*commonpb.KeyValuePair{
+				{Key: common.DimKey, Value: "256"}, // Different dimension
+			},
+			UserIndexParams: []*commonpb.KeyValuePair{
+				{Key: common.MetricTypeKey, Value: "L2"},
+				{Key: common.IndexTypeKey, Value: "HNSW"},
+			},
+		}
+		assert.False(t, checkParams(fieldIndex, req))
+	})
+
+	t.Run("mmap enabled should be ignored", func(t *testing.T) {
+		fieldIndex := &model.Index{
+			TypeParams: []*commonpb.KeyValuePair{
+				{Key: common.DimKey, Value: "128"},
+			},
+			UserIndexParams: []*commonpb.KeyValuePair{
+				{Key: common.MetricTypeKey, Value: "L2"},
+				{Key: common.IndexTypeKey, Value: "HNSW"},
+			},
+		}
+		req := &indexpb.CreateIndexRequest{
+			TypeParams: []*commonpb.KeyValuePair{
+				{Key: common.DimKey, Value: "128"},
+				{Key: common.MmapEnabledKey, Value: "true"},
+			},
+			UserIndexParams: []*commonpb.KeyValuePair{
+				{Key: common.MetricTypeKey, Value: "L2"},
+				{Key: common.IndexTypeKey, Value: "HNSW"},
+			},
+		}
+		assert.True(t, checkParams(fieldIndex, req))
 	})
 }

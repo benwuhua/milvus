@@ -40,6 +40,7 @@ import (
 	"github.com/milvus-io/milvus/pkg/v2/common"
 	"github.com/milvus-io/milvus/pkg/v2/objectstorage"
 	"github.com/milvus-io/milvus/pkg/v2/proto/datapb"
+	"github.com/milvus-io/milvus/pkg/v2/proto/indexpb"
 	"github.com/milvus-io/milvus/pkg/v2/util/metautil"
 	"github.com/milvus-io/milvus/pkg/v2/util/paramtable"
 	"github.com/milvus-io/milvus/pkg/v2/util/typeutil"
@@ -57,12 +58,13 @@ type PackWriterV3Suite struct {
 	logIDAlloc   allocator.Interface
 	mockBinlogIO *mock_util.MockBinlogIO
 
-	schema       *schemapb.CollectionSchema
-	cm           storage.ChunkManager
-	rootPath     string
-	maxRowNum    int64
-	chunkSize    uint64
-	currentSplit []storagecommon.ColumnGroup
+	schema        *schemapb.CollectionSchema
+	cm            storage.ChunkManager
+	rootPath      string
+	maxRowNum     int64
+	chunkSize     uint64
+	currentSplit  []storagecommon.ColumnGroup
+	storageConfig *indexpb.StorageConfig
 }
 
 func (s *PackWriterV3Suite) SetupTest() {
@@ -117,6 +119,10 @@ func (s *PackWriterV3Suite) SetupTest() {
 	allFields := typeutil.GetAllFieldSchemas(s.schema)
 	s.currentSplit = storagecommon.SplitColumns(allFields, map[int64]storagecommon.ColumnStats{}, storagecommon.NewSelectedDataTypePolicy(), storagecommon.NewRemanentShortPolicy(-1))
 	s.cm = storage.NewLocalChunkManager(objectstorage.RootPath(s.rootPath))
+	s.storageConfig = &indexpb.StorageConfig{
+		StorageType: "local",
+		RootPath:    s.rootPath,
+	}
 }
 
 func (s *PackWriterV3Suite) TearDownTest() {
@@ -160,12 +166,12 @@ func (s *PackWriterV3Suite) TestPackWriterV3_Write() {
 
 	pack := new(SyncPack).WithCollectionID(collectionID).WithPartitionID(partitionID).WithSegmentID(segmentID).WithChannelName(channelName).WithInsertData(genInsertData(rows, s.schema)).WithDeleteData(deletes)
 
-	bw := NewBulkPackWriterV3(mc, s.schema, s.cm, s.logIDAlloc, packed.DefaultWriteBufferSize, 0, nil, s.currentSplit, manifestPath)
+	bw := NewBulkPackWriterV3(mc, s.schema, s.cm, s.logIDAlloc, packed.DefaultWriteBufferSize, 0, s.storageConfig, s.currentSplit, manifestPath)
 
 	gotInserts, _, _, _, writtenManifestPath, _, err := bw.Write(context.Background(), pack)
 	s.NoError(err)
 	s.Equal(gotInserts[0].Binlogs[0].GetEntriesNum(), int64(rows))
-	writtenBasePath, revision, err := packed.UnmarshalManfestPath(writtenManifestPath)
+	writtenBasePath, revision, err := packed.UnmarshalManifestPath(writtenManifestPath)
 	s.NoError(err)
 	s.Equal(basePath, writtenBasePath)
 	s.Greater(revision, int64(0))
@@ -185,7 +191,7 @@ func (s *PackWriterV3Suite) TestWriteEmptyInsertData() {
 	manifestPath := packed.MarshalManifestPath(basePath, -1)
 
 	pack := new(SyncPack).WithCollectionID(collectionID).WithPartitionID(partitionID).WithSegmentID(segmentID).WithChannelName(channelName)
-	bw := NewBulkPackWriterV3(mc, s.schema, s.cm, s.logIDAlloc, packed.DefaultWriteBufferSize, 0, nil, s.currentSplit, manifestPath)
+	bw := NewBulkPackWriterV3(mc, s.schema, s.cm, s.logIDAlloc, packed.DefaultWriteBufferSize, 0, s.storageConfig, s.currentSplit, manifestPath)
 
 	_, _, _, _, _, _, err := bw.Write(context.Background(), pack)
 	s.NoError(err)
@@ -219,7 +225,7 @@ func (s *PackWriterV3Suite) TestNoPkField() {
 	buf.Append(data)
 
 	pack := new(SyncPack).WithCollectionID(collectionID).WithPartitionID(partitionID).WithSegmentID(segmentID).WithChannelName(channelName).WithInsertData([]*storage.InsertData{buf})
-	bw := NewBulkPackWriterV3(mc, s.schema, s.cm, s.logIDAlloc, packed.DefaultWriteBufferSize, 0, nil, s.currentSplit, manifestPath)
+	bw := NewBulkPackWriterV3(mc, s.schema, s.cm, s.logIDAlloc, packed.DefaultWriteBufferSize, 0, s.storageConfig, s.currentSplit, manifestPath)
 
 	_, _, _, _, _, _, err := bw.Write(context.Background(), pack)
 	s.Error(err)
@@ -245,7 +251,7 @@ func (s *PackWriterV3Suite) TestWriteInsertDataError() {
 	buf.Append(data)
 
 	pack := new(SyncPack).WithCollectionID(collectionID).WithPartitionID(partitionID).WithSegmentID(segmentID).WithChannelName(channelName).WithInsertData([]*storage.InsertData{buf})
-	bw := NewBulkPackWriterV3(mc, s.schema, s.cm, s.logIDAlloc, packed.DefaultWriteBufferSize, 0, nil, s.currentSplit, manifestPath)
+	bw := NewBulkPackWriterV3(mc, s.schema, s.cm, s.logIDAlloc, packed.DefaultWriteBufferSize, 0, s.storageConfig, s.currentSplit, manifestPath)
 
 	_, _, _, _, _, _, err := bw.Write(context.Background(), pack)
 	s.Error(err)
@@ -266,7 +272,7 @@ func (s *PackWriterV3Suite) TestInvalidManifestPath() {
 	invalidManifestPath := "invalid-manifest-path"
 
 	pack := new(SyncPack).WithCollectionID(collectionID).WithPartitionID(partitionID).WithSegmentID(segmentID).WithChannelName(channelName).WithInsertData(genInsertData(rows, s.schema))
-	bw := NewBulkPackWriterV3(mc, s.schema, s.cm, s.logIDAlloc, packed.DefaultWriteBufferSize, 0, nil, s.currentSplit, invalidManifestPath)
+	bw := NewBulkPackWriterV3(mc, s.schema, s.cm, s.logIDAlloc, packed.DefaultWriteBufferSize, 0, s.storageConfig, s.currentSplit, invalidManifestPath)
 
 	_, _, _, _, _, _, err := bw.Write(context.Background(), pack)
 	s.Error(err)
@@ -308,13 +314,17 @@ func (s *PackWriterV3Suite) TestWriteWithDeleteData() {
 	// Test with only delete data (no inserts)
 	pack := new(SyncPack).WithCollectionID(collectionID).WithPartitionID(partitionID).WithSegmentID(segmentID).WithChannelName(channelName).WithDeleteData(deletes)
 
-	bw := NewBulkPackWriterV3(mc, s.schema, s.cm, s.logIDAlloc, packed.DefaultWriteBufferSize, 0, nil, s.currentSplit, manifestPath)
+	bw := NewBulkPackWriterV3(mc, s.schema, s.cm, s.logIDAlloc, packed.DefaultWriteBufferSize, 0, s.storageConfig, s.currentSplit, manifestPath)
 
-	gotInserts, gotDeletes, _, _, _, _, err := bw.Write(context.Background(), pack)
+	gotInserts, gotDeletes, _, _, writtenManifestPath, _, err := bw.Write(context.Background(), pack)
 	s.NoError(err)
 	s.Equal(0, len(gotInserts)) // No insert binlogs when only deletes
-	s.NotNil(gotDeletes)
-	s.Equal(int64(rows), gotDeletes.Binlogs[0].GetEntriesNum())
+	// For V3, deltas are nil since deltalogs are stored in manifest
+	s.Nil(gotDeletes)
+	// Verify manifest was updated (version should be > -1)
+	_, revision, err := packed.UnmarshalManifestPath(writtenManifestPath)
+	s.NoError(err)
+	s.Greater(revision, int64(-1))
 }
 
 func (s *PackWriterV3Suite) TestV3InheritsV2Fields() {
@@ -329,7 +339,7 @@ func (s *PackWriterV3Suite) TestV3InheritsV2Fields() {
 	mc := metacache.NewMockMetaCache(s.T())
 
 	// Create V3 writer and verify it has access to V2 fields
-	bw := NewBulkPackWriterV3(mc, s.schema, s.cm, s.logIDAlloc, packed.DefaultWriteBufferSize, packed.DefaultMultiPartUploadSize, nil, s.currentSplit, manifestPath)
+	bw := NewBulkPackWriterV3(mc, s.schema, s.cm, s.logIDAlloc, packed.DefaultWriteBufferSize, packed.DefaultMultiPartUploadSize, s.storageConfig, s.currentSplit, manifestPath)
 
 	// Verify V3 can access fields from embedded V2
 	s.Equal(s.schema, bw.schema)
@@ -339,4 +349,198 @@ func (s *PackWriterV3Suite) TestV3InheritsV2Fields() {
 	s.EqualValues(packed.DefaultMultiPartUploadSize, bw.multiPartUploadSize)
 	s.Equal(s.currentSplit, bw.columnGroups)
 	s.Equal(manifestPath, bw.manifestPath)
+}
+
+// genInsertDataWithPKOffset generates insert data with PKs starting at pkOffset+1.
+func genInsertDataWithPKOffset(size int, pkOffset int, schema *schemapb.CollectionSchema) []*storage.InsertData {
+	buf, _ := storage.NewInsertData(schema)
+	for i := 0; i < size; i++ {
+		data := make(map[storage.FieldID]any)
+		data[common.RowIDField] = int64(pkOffset + i + 1)
+		data[common.TimeStampField] = int64(pkOffset + i + 1)
+		data[100] = int64(pkOffset + i + 1) // pk field
+
+		vector := make([]float32, 128)
+		for j := range vector {
+			vector[j] = float32(i+j) * 0.01
+		}
+		data[101] = vector
+
+		vectorData := []float32{float32(i) * 0.1, float32(i) * 0.2}
+		vectorArray := &schemapb.VectorField{
+			Dim: 128,
+			Data: &schemapb.VectorField_FloatVector{
+				FloatVector: &schemapb.FloatArray{Data: vectorData},
+			},
+		}
+		data[103] = vectorArray
+		buf.Append(data)
+	}
+	return []*storage.InsertData{buf}
+}
+
+// TestMultiBatchStatsAccumulation verifies that bloom filter and BM25 stat files
+// from multiple batches accumulate in the manifest rather than being replaced.
+// This is the regression test for the bug where loon_transaction_update_stat
+// replaced the previous batch's stat entry, leaving only the last batch's
+// bloom filter in the manifest.
+func (s *PackWriterV3Suite) TestMultiBatchStatsAccumulation() {
+	collectionID := int64(123)
+	partitionID := int64(456)
+	segmentID := int64(10001) // unique ID to avoid manifest collision with other tests
+	channelName := fmt.Sprintf("by-dev-rootcoord-dml_0_%dv0", collectionID)
+	batchRows := 5
+
+	bfs := pkoracle.NewBloomFilterSet()
+
+	k := metautil.JoinIDPath(collectionID, partitionID, segmentID)
+	basePath := path.Join(common.SegmentInsertLogPath, k)
+	manifestPath := packed.MarshalManifestPath(basePath, -1)
+
+	seg := metacache.NewSegmentInfo(&datapb.SegmentInfo{
+		ManifestPath: manifestPath,
+	}, bfs, nil)
+	metacache.UpdateNumOfRows(1000)(seg)
+	mc := metacache.NewMockMetaCache(s.T())
+	mc.EXPECT().Collection().Return(collectionID).Maybe()
+	mc.EXPECT().GetSchema(mock.Anything).Return(s.schema).Maybe()
+	mc.EXPECT().GetSegmentByID(segmentID).Return(seg, true).Maybe()
+	mc.EXPECT().GetSegmentsBy(mock.Anything, mock.Anything).Return([]*metacache.SegmentInfo{seg}).Maybe()
+	mc.EXPECT().UpdateSegments(mock.Anything, mock.Anything).Run(func(action metacache.SegmentAction, filters ...metacache.SegmentFilter) {
+		action(seg)
+	}).Return().Maybe()
+
+	bfKey := fmt.Sprintf("bloom_filter.%d", 100) // pk field ID
+
+	// Batch 1: PKs 1..5
+	pack1 := new(SyncPack).
+		WithCollectionID(collectionID).
+		WithPartitionID(partitionID).
+		WithSegmentID(segmentID).
+		WithChannelName(channelName).
+		WithInsertData(genInsertDataWithPKOffset(batchRows, 0, s.schema)).
+		WithBatchRows(int64(batchRows))
+
+	bw1 := NewBulkPackWriterV3(mc, s.schema, s.cm, s.logIDAlloc, packed.DefaultWriteBufferSize, 0, s.storageConfig, s.currentSplit, manifestPath)
+	_, _, _, _, manifest1, _, err := bw1.Write(context.Background(), pack1)
+	s.Require().NoError(err)
+
+	stats1, err := packed.GetManifestStats(manifest1, s.storageConfig)
+	s.Require().NoError(err)
+	count1 := len(stats1[bfKey].Paths)
+	s.Greater(count1, 0, "batch 1 should produce bloom filter files")
+
+	// Batch 2: PKs 6..10, starting from the manifest written by batch 1
+	pack2 := new(SyncPack).
+		WithCollectionID(collectionID).
+		WithPartitionID(partitionID).
+		WithSegmentID(segmentID).
+		WithChannelName(channelName).
+		WithInsertData(genInsertDataWithPKOffset(batchRows, batchRows, s.schema)).
+		WithBatchRows(int64(batchRows))
+
+	bw2 := NewBulkPackWriterV3(mc, s.schema, s.cm, s.logIDAlloc, packed.DefaultWriteBufferSize, 0, s.storageConfig, s.currentSplit, manifest1)
+	_, _, _, _, manifest2, _, err := bw2.Write(context.Background(), pack2)
+	s.Require().NoError(err)
+
+	stats2, err := packed.GetManifestStats(manifest2, s.storageConfig)
+	s.Require().NoError(err)
+	count2 := len(stats2[bfKey].Paths)
+	s.Greater(count2, count1, "batch 2 should accumulate more bloom filter files than batch 1")
+
+	// Batch 3: PKs 11..15
+	pack3 := new(SyncPack).
+		WithCollectionID(collectionID).
+		WithPartitionID(partitionID).
+		WithSegmentID(segmentID).
+		WithChannelName(channelName).
+		WithInsertData(genInsertDataWithPKOffset(batchRows, batchRows*2, s.schema)).
+		WithBatchRows(int64(batchRows))
+
+	bw3 := NewBulkPackWriterV3(mc, s.schema, s.cm, s.logIDAlloc, packed.DefaultWriteBufferSize, 0, s.storageConfig, s.currentSplit, manifest2)
+	_, _, _, _, manifest3, _, err := bw3.Write(context.Background(), pack3)
+	s.Require().NoError(err)
+
+	stats3, err := packed.GetManifestStats(manifest3, s.storageConfig)
+	s.Require().NoError(err)
+	count3 := len(stats3[bfKey].Paths)
+	s.Greater(count3, count2, "batch 3 should accumulate more bloom filter files than batch 2")
+	s.NotEmpty(stats3[bfKey].Metadata["memory_size"], "memory_size metadata should be set")
+}
+
+// TestMultiBatchBM25StatsAccumulation verifies that BM25 stat files from
+// multiple batches accumulate in the manifest.
+func (s *PackWriterV3Suite) TestMultiBatchBM25StatsAccumulation() {
+	collectionID := int64(123)
+	partitionID := int64(456)
+	segmentID := int64(10002) // unique ID to avoid manifest collision with other tests
+	channelName := fmt.Sprintf("by-dev-rootcoord-dml_0_%dv0", collectionID)
+	batchRows := 5
+
+	bfs := pkoracle.NewBloomFilterSet()
+
+	k := metautil.JoinIDPath(collectionID, partitionID, segmentID)
+	basePath := path.Join(common.SegmentInsertLogPath, k)
+	manifestPath := packed.MarshalManifestPath(basePath, -1)
+
+	seg := metacache.NewSegmentInfo(&datapb.SegmentInfo{
+		ManifestPath: manifestPath,
+	}, bfs, nil)
+	metacache.UpdateNumOfRows(1000)(seg)
+	mc := metacache.NewMockMetaCache(s.T())
+	mc.EXPECT().Collection().Return(collectionID).Maybe()
+	mc.EXPECT().GetSchema(mock.Anything).Return(s.schema).Maybe()
+	mc.EXPECT().GetSegmentByID(segmentID).Return(seg, true).Maybe()
+	mc.EXPECT().GetSegmentsBy(mock.Anything, mock.Anything).Return([]*metacache.SegmentInfo{seg}).Maybe()
+	mc.EXPECT().UpdateSegments(mock.Anything, mock.Anything).Run(func(action metacache.SegmentAction, filters ...metacache.SegmentFilter) {
+		action(seg)
+	}).Return().Maybe()
+
+	bm25FieldID := int64(200)
+	makeBM25Stats := func() map[int64]*storage.BM25Stats {
+		stats := storage.NewBM25Stats()
+		stats.Append(map[uint32]float32{1: 1.0, 2: 2.0})
+		return map[int64]*storage.BM25Stats{bm25FieldID: stats}
+	}
+
+	bm25Key := fmt.Sprintf("bm25.%d", bm25FieldID)
+
+	// Batch 1
+	pack1 := new(SyncPack).
+		WithCollectionID(collectionID).
+		WithPartitionID(partitionID).
+		WithSegmentID(segmentID).
+		WithChannelName(channelName).
+		WithInsertData(genInsertDataWithPKOffset(batchRows, 0, s.schema)).
+		WithBatchRows(int64(batchRows)).
+		WithBM25Stats(makeBM25Stats())
+
+	bw1 := NewBulkPackWriterV3(mc, s.schema, s.cm, s.logIDAlloc, packed.DefaultWriteBufferSize, 0, s.storageConfig, s.currentSplit, manifestPath)
+	_, _, _, _, manifest1, _, err := bw1.Write(context.Background(), pack1)
+	s.Require().NoError(err)
+
+	stats1, err := packed.GetManifestStats(manifest1, s.storageConfig)
+	s.Require().NoError(err)
+	count1 := len(stats1[bm25Key].Paths)
+	s.Greater(count1, 0, "batch 1 should produce bm25 stat files")
+
+	// Batch 2
+	pack2 := new(SyncPack).
+		WithCollectionID(collectionID).
+		WithPartitionID(partitionID).
+		WithSegmentID(segmentID).
+		WithChannelName(channelName).
+		WithInsertData(genInsertDataWithPKOffset(batchRows, batchRows, s.schema)).
+		WithBatchRows(int64(batchRows)).
+		WithBM25Stats(makeBM25Stats())
+
+	bw2 := NewBulkPackWriterV3(mc, s.schema, s.cm, s.logIDAlloc, packed.DefaultWriteBufferSize, 0, s.storageConfig, s.currentSplit, manifest1)
+	_, _, _, _, manifest2, _, err := bw2.Write(context.Background(), pack2)
+	s.Require().NoError(err)
+
+	stats2, err := packed.GetManifestStats(manifest2, s.storageConfig)
+	s.Require().NoError(err)
+	count2 := len(stats2[bm25Key].Paths)
+	s.Greater(count2, count1, "batch 2 should accumulate more bm25 files than batch 1")
+	s.NotEmpty(stats2[bm25Key].Metadata["memory_size"], "memory_size metadata should be set")
 }

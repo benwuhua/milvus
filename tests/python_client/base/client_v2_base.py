@@ -116,12 +116,13 @@ class TestMilvusClientV2Base(Base):
         res, check = api_request([client.create_collection, collection_name, dimension, primary_field_name,
                                   id_type, vector_field_name, metric_type, auto_id, timeout, schema,
                                   index_params], **kwargs)
+        # Register for cleanup BEFORE assertion check, so collection is cleaned up even if check fails
+        # (e.g., when check_task=err_res but API actually succeeds due to server bug)
+        if check and force_teardown:
+            self.tear_down_collection_names.append(collection_name)
         check_result = ResponseChecker(res, func_name, check_task, check_items, check,
                                        collection_name=collection_name, dimension=dimension,
                                        **kwargs).run()
-        if force_teardown:
-            # if running with collection-shared-mode, please not teardown here, but do it in the specific test class
-            self.tear_down_collection_names.append(collection_name)
         return res, check_result
 
     def has_collection(self, client, collection_name, timeout=None, check_task=None,
@@ -333,6 +334,15 @@ class TestMilvusClientV2Base(Base):
     def list_indexes(self, client, collection_name, field_name=None, check_task=None, check_items=None, **kwargs):
         func_name = sys._getframe().f_code.co_name
         res, check = api_request([client.list_indexes, collection_name, field_name], **kwargs)
+        check_result = ResponseChecker(res, func_name, check_task, check_items, check,
+                                       collection_name=collection_name,
+                                       **kwargs).run()
+        return res, check_result
+
+    @trace()
+    def describe_replica(self, client, collection_name, check_task=None, check_items=None, **kwargs):
+        func_name = sys._getframe().f_code.co_name
+        res, check = api_request([client.describe_replica, collection_name], **kwargs)
         check_result = ResponseChecker(res, func_name, check_task, check_items, check,
                                        collection_name=collection_name,
                                        **kwargs).run()

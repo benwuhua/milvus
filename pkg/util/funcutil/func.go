@@ -384,9 +384,9 @@ func IsControlChannel(channel string) bool {
 	return strings.HasSuffix(channel, ControlChannelSuffix)
 }
 
-// IsOnPhysicalChannel checks if the channel is on the physical channel
+// IsOnPhysicalChannel checks if the channel is on the physical channel.
 func IsOnPhysicalChannel(channel string, physicalChannel string) bool {
-	return strings.HasPrefix(channel, physicalChannel)
+	return ToPhysicalChannel(channel) == physicalChannel
 }
 
 // ToPhysicalChannel get physical channel name from virtual channel name
@@ -711,14 +711,18 @@ func IsEmptyString(str string) bool {
 	return strings.TrimSpace(str) == ""
 }
 
-func HandleTenantForEtcdKey(prefix string, tenant string, key string) string {
+// HandleTenantForEtcdPrefix builds an etcd prefix for range scans (always ends with /).
+// Two layers: HandleTenantForEtcdPrefix("a", "b") => "a/b/"
+// Three layers: HandleTenantForEtcdPrefix("a", "b", "c") => "a/b/c/"
+func HandleTenantForEtcdPrefix(prefix string, tenant string, subPrefixes ...string) string {
 	res := prefix
 	if tenant != "" {
 		res += "/" + tenant
 	}
-	if key != "" {
-		res += "/" + key
+	for _, sub := range subPrefixes {
+		res += "/" + sub
 	}
+	res += "/"
 	return res
 }
 

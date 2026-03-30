@@ -178,7 +178,7 @@ func validateRunAnalyzer(req *milvuspb.RunAnalyzerRequest) error {
 	return nil
 }
 
-func validateMaxQueryResultWindow(offset int64, limit int64) error {
+func validateMaxQueryResultWindow(offset int64, limit int64, bigTopKEnabled bool) error {
 	if offset < 0 {
 		return fmt.Errorf("%s [%d] is invalid, should be gte than 0", OffsetKey, offset)
 	}
@@ -188,14 +188,20 @@ func validateMaxQueryResultWindow(offset int64, limit int64) error {
 
 	depth := offset + limit
 	maxQueryResultWindow := Params.QuotaConfig.MaxQueryResultWindow.GetAsInt64()
+	if bigTopKEnabled {
+		maxQueryResultWindow = Params.QuotaConfig.BigMaxQueryResultWindow.GetAsInt64()
+	}
 	if depth <= 0 || depth > maxQueryResultWindow {
 		return fmt.Errorf("(offset+limit) should be in range [1, %d], but got %d", maxQueryResultWindow, depth)
 	}
 	return nil
 }
 
-func validateLimit(limit int64) error {
+func validateLimit(limit int64, bigTopKEnabled bool) error {
 	topKLimit := Params.QuotaConfig.TopKLimit.GetAsInt64()
+	if bigTopKEnabled {
+		topKLimit = Params.QuotaConfig.BigTopKLimit.GetAsInt64()
+	}
 	if limit <= 0 || limit > topKLimit {
 		return fmt.Errorf("it should be in range [1, %d], but got %d", topKLimit, limit)
 	}
@@ -1184,6 +1190,10 @@ func autoGenPrimaryFieldData(fieldSchema *schemapb.FieldSchema, data interface{}
 }
 
 func autoGenDynamicFieldData(data [][]byte) *schemapb.FieldData {
+	validData := make([]bool, len(data))
+	for i := range validData {
+		validData[i] = true
+	}
 	return &schemapb.FieldData{
 		FieldName: common.MetaFieldName,
 		Type:      schemapb.DataType_JSON,
@@ -1197,6 +1207,7 @@ func autoGenDynamicFieldData(data [][]byte) *schemapb.FieldData {
 			},
 		},
 		IsDynamic: true,
+		ValidData: validData,
 	}
 }
 
@@ -1553,6 +1564,13 @@ func recallCal[T string | int64](results []T, gts []T) float32 {
 func computeRecall(results *schemapb.SearchResultData, gts *schemapb.SearchResultData) error {
 	if results.GetNumQueries() != gts.GetNumQueries() {
 		return fmt.Errorf("num of queries is inconsistent between search results(%d) and ground truth(%d)", results.GetNumQueries(), gts.GetNumQueries())
+	}
+
+	// When search returns no results, IDs field is nil. Set recalls to 0 for all queries.
+	if results.GetIds() == nil || results.GetIds().GetIdField() == nil ||
+		gts.GetIds() == nil || gts.GetIds().GetIdField() == nil {
+		results.Recalls = make([]float32, results.GetNumQueries())
+		return nil
 	}
 
 	switch results.GetIds().GetIdField().(type) {
@@ -2415,7 +2433,7 @@ func ErrWithLog(logger *log.MLogger, msg string, err error) error {
 	return wrapErr
 }
 
-func verifyDynamicFieldData(schema *schemapb.CollectionSchema, insertMsg *msgstream.InsertMsg) error {
+func verifyDynamicFieldData(schema *schemapb.CollectionSchema, insertMsg *msgstream.InsertMsg, skipStaticFieldNameCheck bool) error {
 	for _, field := range insertMsg.FieldsData {
 		if field.GetFieldName() == common.MetaFieldName {
 			if !schema.EnableDynamicField {
@@ -2433,10 +2451,12 @@ func verifyDynamicFieldData(schema *schemapb.CollectionSchema, insertMsg *msgstr
 				if _, ok := jsonData[common.MetaFieldName]; ok {
 					return fmt.Errorf("cannot set json key to: %s", common.MetaFieldName)
 				}
-				for _, f := range schema.GetFields() {
-					if _, ok := jsonData[f.GetName()]; ok {
-						log.Info("dynamic field name include the static field name", zap.String("fieldName", f.GetName()))
-						return fmt.Errorf("dynamic field name cannot include the static field name: %s", f.GetName())
+				if !skipStaticFieldNameCheck {
+					for _, f := range schema.GetFields() {
+						if _, ok := jsonData[f.GetName()]; ok {
+							log.Info("dynamic field name include the static field name", zap.String("fieldName", f.GetName()))
+							return fmt.Errorf("dynamic field name cannot include the static field name: %s", f.GetName())
+						}
 					}
 				}
 			}
@@ -2446,11 +2466,15 @@ func verifyDynamicFieldData(schema *schemapb.CollectionSchema, insertMsg *msgstr
 	return nil
 }
 
-func checkDynamicFieldData(schema *schemapb.CollectionSchema, insertMsg *msgstream.InsertMsg) error {
+// doCheckDynamicFieldData is the shared implementation for dynamic field validation.
+// When skipStaticFieldNameCheck is true, $meta keys matching static field names are
+// allowed — this is needed for partial updates after schema evolution, where $meta
+// may legitimately contain keys that now correspond to static columns.
+func doCheckDynamicFieldData(schema *schemapb.CollectionSchema, insertMsg *msgstream.InsertMsg, skipStaticFieldNameCheck bool) error {
 	for _, data := range insertMsg.FieldsData {
 		if data.IsDynamic {
 			data.FieldName = common.MetaFieldName
-			return verifyDynamicFieldData(schema, insertMsg)
+			return verifyDynamicFieldData(schema, insertMsg, skipStaticFieldNameCheck)
 		}
 	}
 	defaultData := make([][]byte, insertMsg.NRows())
@@ -2462,16 +2486,26 @@ func checkDynamicFieldData(schema *schemapb.CollectionSchema, insertMsg *msgstre
 	return nil
 }
 
+func checkDynamicFieldData(schema *schemapb.CollectionSchema, insertMsg *msgstream.InsertMsg) error {
+	return doCheckDynamicFieldData(schema, insertMsg, false)
+}
+
+// checkDynamicFieldDataForPartialUpdate is a relaxed version of checkDynamicFieldData
+// for partial updates. After schema evolution, $meta may legitimately contain keys
+// matching static field names (e.g., a dynamic field "end_timestamp" that was later
+// added as a static column). This function validates JSON format and rejects the
+// reserved $meta key, but skips the static field name conflict check so that
+// existing dynamic field data is preserved.
+func checkDynamicFieldDataForPartialUpdate(schema *schemapb.CollectionSchema, insertMsg *msgstream.InsertMsg) error {
+	return doCheckDynamicFieldData(schema, insertMsg, true)
+}
+
 func addNamespaceData(schema *schemapb.CollectionSchema, insertMsg *msgstream.InsertMsg) error {
 	err := common.CheckNamespace(schema, insertMsg.InsertRequest.Namespace)
 	if err != nil {
 		return err
 	}
-	namespaceEnabeld, _, err := common.ParseNamespaceProp(schema.Properties...)
-	if err != nil {
-		return err
-	}
-	if !namespaceEnabeld {
+	if !schema.GetEnableNamespace() {
 		return nil
 	}
 
@@ -2481,10 +2515,28 @@ func addNamespaceData(schema *schemapb.CollectionSchema, insertMsg *msgstream.In
 		return fmt.Errorf("namespace field not found")
 	}
 
-	// check namespace field data is already set
+	// If namespace field data is already present, validate it instead of rejecting outright.
 	for _, fieldData := range insertMsg.FieldsData {
 		if fieldData.FieldId == namespaceField.FieldID {
-			return fmt.Errorf("namespace field data is already set by users")
+			ns := ""
+			if insertMsg.InsertRequest.Namespace != nil {
+				ns = *insertMsg.InsertRequest.Namespace
+			}
+			scalars := fieldData.GetScalars()
+			if scalars == nil {
+				return fmt.Errorf("invalid namespace field data layout")
+			}
+			strData := scalars.GetStringData()
+			if strData == nil {
+				return fmt.Errorf("invalid namespace field data layout")
+			}
+			for _, v := range strData.GetData() {
+				if v != ns {
+					return fmt.Errorf("namespace field value %q mismatches namespace %q", v, ns)
+				}
+			}
+			// Values are consistent with the namespace; nothing more to do.
+			return nil
 		}
 	}
 

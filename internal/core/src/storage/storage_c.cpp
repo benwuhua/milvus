@@ -93,6 +93,12 @@ InitRemoteChunkManagerSingleton(CStorageConfig c_storage_config) {
         storage_config.max_connections = c_storage_config.max_connections;
         storage_config.gcp_credential_json =
             std::string(c_storage_config.gcp_credential_json);
+        if (c_storage_config.tls_min_version != nullptr) {
+            storage_config.tls_min_version =
+                std::string(c_storage_config.tls_min_version);
+        }
+        storage_config.use_crc32c_checksum =
+            c_storage_config.use_crc32c_checksum;
         milvus::storage::RemoteChunkManagerSingleton::GetInstance().Init(
             storage_config);
 

@@ -49,6 +49,7 @@ const (
 	DefaultMiddlePriorityThreadCoreCoefficient = 5
 	DefaultLowPriorityThreadCoreCoefficient    = 1
 	DefaultBM25LoadThreadCoreCoefficient       = 1
+	DefaultThreadPoolMaxThreadsSize            = 16
 
 	DefaultSessionTTL        = 15 // s
 	DefaultSessionRetryTimes = 30
@@ -230,6 +231,7 @@ type commonConfig struct {
 	MiddlePriorityThreadCoreCoefficient ParamItem `refreshable:"true"`
 	LowPriorityThreadCoreCoefficient    ParamItem `refreshable:"true"`
 	BM25LoadThreadCoreCoefficient       ParamItem `refreshable:"true"`
+	ThreadPoolMaxThreadsSize            ParamItem `refreshable:"true"`
 	EnableMaterializedView              ParamItem `refreshable:"false"`
 	BuildIndexThreadPoolRatio           ParamItem `refreshable:"false"`
 	MaxDegree                           ParamItem `refreshable:"true"`
@@ -241,10 +243,11 @@ type commonConfig struct {
 	BeamWidthRatio                      ParamItem `refreshable:"true"`
 	GracefulTime                        ParamItem `refreshable:"true"`
 	GracefulStopTimeout                 ParamItem `refreshable:"true"`
-	EnableNamespace                     ParamItem `refreshable:"false"`
+	ParquetStatsSkipIndex               ParamItem `refreshable:"true"`
 
-	StorageType ParamItem `refreshable:"false"`
-	SimdType    ParamItem `refreshable:"false"`
+	StorageType                   ParamItem `refreshable:"false"`
+	ManifestTransactionRetryLimit ParamItem `refreshable:"true"`
+	SimdType                      ParamItem `refreshable:"false"`
 
 	DiskWriteMode         ParamItem `refreshable:"true"`
 	DiskWriteBufferSizeKb ParamItem `refreshable:"true"`
@@ -342,6 +345,9 @@ type commonConfig struct {
 	HybridSearchRequeryPolicy ParamItem `refreshable:"true"`
 	QNFileResourceMode        ParamItem `refreshable:"true"`
 	DNFileResourceMode        ParamItem `refreshable:"true"`
+
+	// group by
+	GroupByMaxGroups ParamItem `refreshable:"false"`
 }
 
 func (p *commonConfig) init(base *BaseTable) {
@@ -619,14 +625,14 @@ This configuration is only used by querynode and indexnode, it selects CPU instr
 	}
 	p.GracefulStopTimeout.Init(base.mgr)
 
-	p.EnableNamespace = ParamItem{
-		Key:          "common.namespace.enabled",
+	p.ParquetStatsSkipIndex = ParamItem{
+		Key:          "common.parquetStatsSkipIndex.enabled",
 		Version:      "2.6.0",
 		DefaultValue: "false",
-		Doc:          "whether to enable namespace, this parameter may be deprecated in the future. Just keep it for compatibility.",
+		Doc:          "whether to skip parquet stats index when reading; set true to enable skipping.",
 		Export:       true,
 	}
-	p.EnableNamespace.Init(base.mgr)
+	p.ParquetStatsSkipIndex.Init(base.mgr)
 
 	p.StorageType = ParamItem{
 		Key:          "common.storageType",
@@ -636,6 +642,15 @@ This configuration is only used by querynode and indexnode, it selects CPU instr
 		Export:       true,
 	}
 	p.StorageType.Init(base.mgr)
+
+	p.ManifestTransactionRetryLimit = ParamItem{
+		Key:          "common.storage.manifestTransactionRetryLimit",
+		Version:      "2.6.10",
+		DefaultValue: "10",
+		Doc:          "Maximum number of retry attempts for V3 storage manifest transaction commits on optimistic concurrency conflicts",
+		Export:       true,
+	}
+	p.ManifestTransactionRetryLimit.Init(base.mgr)
 
 	p.HighPriorityThreadCoreCoefficient = ParamItem{
 		Key:          "common.threadCoreCoefficient.highPriority",
@@ -676,6 +691,15 @@ This configuration is only used by querynode and indexnode, it selects CPU instr
 		Export: true,
 	}
 	p.BM25LoadThreadCoreCoefficient.Init(base.mgr)
+
+	p.ThreadPoolMaxThreadsSize = ParamItem{
+		Key:          "common.threadCoreCoefficient.maxThreadsSize",
+		Version:      "2.6.13",
+		DefaultValue: strconv.Itoa(DefaultThreadPoolMaxThreadsSize),
+		Doc:          "The maximum number of threads in the thread pool, only effective when greater than 0",
+		Export:       true,
+	}
+	p.ThreadPoolMaxThreadsSize.Init(base.mgr)
 
 	p.DiskWriteMode = ParamItem{
 		Key:          "common.diskWriteMode",
@@ -976,7 +1000,7 @@ Large numeric passwords require double quotes to avoid yaml parsing precision is
 	p.UseLoonFFI = ParamItem{
 		Key:          "common.storage.useLoonFFI",
 		Version:      "2.6.7",
-		DefaultValue: "false",
+		DefaultValue: "true",
 		Export:       true,
 	}
 	p.UseLoonFFI.Init(base.mgr)
@@ -1345,6 +1369,21 @@ If enabled, IPv6 ULA/global addresses will be prioritized ahead of IPv4.`,
 		Export:       true,
 	}
 	p.DNFileResourceMode.Init(base.mgr)
+
+	p.GroupByMaxGroups = ParamItem{
+		Key:          "common.groupBy.maxGroups",
+		Version:      "2.6.0",
+		DefaultValue: "100000",
+		Doc:          "Maximum number of groups allowed in GROUP BY aggregation, enforced both per segment and during cross-segment merge. Exceeding this limit fails the query.",
+		Export:       true,
+		Formatter: func(v string) string {
+			if getAsInt64(v) <= 0 {
+				return "100000"
+			}
+			return v
+		},
+	}
+	p.GroupByMaxGroups.Init(base.mgr)
 }
 
 type gpuConfig struct {
@@ -1786,7 +1825,6 @@ func (p *rootCoordConfig) init(base *BaseTable) {
 		Key:          "rootCoord.dmlChannelNum",
 		Version:      "2.0.0",
 		DefaultValue: "16",
-		Forbidden:    true,
 		Doc:          "The number of DML-Channels to create at the root coord startup.",
 		Export:       true,
 	}
@@ -1929,6 +1967,7 @@ type proxyConfig struct {
 	MustUsePartitionKey             ParamItem `refreshable:"true"`
 	SkipAutoIDCheck                 ParamItem `refreshable:"true"`
 	SkipPartitionKeyCheck           ParamItem `refreshable:"true"`
+	ResolveAliasForPrivilege        ParamItem `refreshable:"true"`
 	MaxVarCharLength                ParamItem `refreshable:"false"`
 	MaxTextLength                   ParamItem `refreshable:"false"`
 	MaxResultEntries                ParamItem `refreshable:"true"`
@@ -2035,7 +2074,7 @@ func (p *proxyConfig) init(base *BaseTable) {
 	p.MaxVectorFieldNum = ParamItem{
 		Key:          "proxy.maxVectorFieldNum",
 		Version:      "2.4.0",
-		DefaultValue: "4",
+		DefaultValue: "10",
 		PanicIfEmpty: true,
 		Doc:          "The maximum number of vector fields that can be specified in a collection",
 		Export:       true,
@@ -2371,6 +2410,15 @@ please adjust in embedded Milvus: false`,
 	}
 	p.SkipPartitionKeyCheck.Init(base.mgr)
 
+	p.ResolveAliasForPrivilege = ParamItem{
+		Key:          "proxy.resolveAliasForPrivilege",
+		Version:      "2.6.9",
+		DefaultValue: "true",
+		Doc:          "switch for whether proxy shall resolve alias to actual collection name during RBAC privilege checks",
+		Export:       true,
+	}
+	p.ResolveAliasForPrivilege.Init(base.mgr)
+
 	p.MaxVarCharLength = ParamItem{
 		Key:          "proxy.maxVarCharLength",
 		Version:      "2.4.19",            // hotfix
@@ -2545,6 +2593,7 @@ type queryCoordConfig struct {
 	UpdateCollectionLoadStatusInterval ParamItem `refreshable:"false"`
 	ClusterLevelLoadReplicaNumber      ParamItem `refreshable:"true"`
 	ClusterLevelLoadResourceGroups     ParamItem `refreshable:"true"`
+	ClusterLevelLoadWaitRGReadyTimeout ParamItem `refreshable:"true"`
 
 	// balance batch size in one trigger
 	BalanceSegmentBatchSize            ParamItem `refreshable:"true"`
@@ -2554,11 +2603,16 @@ type queryCoordConfig struct {
 	// query node task parallelism factor
 	QueryNodeTaskParallelismFactor ParamItem `refreshable:"true"`
 
+	// channel task capacity fraction
+	ChannelTaskCapFraction ParamItem `refreshable:"true"`
+
 	BalanceCheckCollectionMaxCount    ParamItem `refreshable:"true"`
 	ResourceExhaustionPenaltyDuration ParamItem `refreshable:"true"`
 	ResourceExhaustionCleanupInterval ParamItem `refreshable:"true"`
 
 	UpdateTargetNeedSegmentDataReady ParamItem `refreshable:"true"`
+
+	AutoWarmupForNonPKIsolationCollection ParamItem `refreshable:"false"`
 }
 
 func (p *queryCoordConfig) init(base *BaseTable) {
@@ -2588,7 +2642,7 @@ func (p *queryCoordConfig) init(base *BaseTable) {
 	p.TaskExecutionCap = ParamItem{
 		Key:          "queryCoord.taskExecutionCap",
 		Version:      "2.2.0",
-		DefaultValue: "256",
+		DefaultValue: "360",
 		Export:       true,
 	}
 	p.TaskExecutionCap.Init(base.mgr)
@@ -3153,6 +3207,15 @@ If this parameter is set false, Milvus simply searches the growing segments with
 	}
 	p.ClusterLevelLoadResourceGroups.Init(base.mgr)
 
+	p.ClusterLevelLoadWaitRGReadyTimeout = ParamItem{
+		Key:          "queryCoord.clusterLevelLoadWaitRGReadyTimeout",
+		Version:      "2.6.13",
+		DefaultValue: "3m",
+		Doc:          "timeout for waiting resource group to have all requested nodes before assigning nodes to new replicas during cluster-level load config scale-up. 0 means no waiting.",
+		Export:       false,
+	}
+	p.ClusterLevelLoadWaitRGReadyTimeout.Init(base.mgr)
+
 	p.AutoBalanceInterval = ParamItem{
 		Key:          "queryCoord.autoBalanceInterval",
 		Version:      "2.5.3",
@@ -3195,11 +3258,20 @@ If this parameter is set false, Milvus simply searches the growing segments with
 	p.QueryNodeTaskParallelismFactor = ParamItem{
 		Key:          "queryCoord.queryNodeTaskParallelismFactor",
 		Version:      "2.5.14",
-		DefaultValue: "1",
+		DefaultValue: "20",
 		Doc:          "the parallelism factor for query node task, which permit query node execute cpuNum * parallelismFactor tasks in parallel",
 		Export:       false,
 	}
 	p.QueryNodeTaskParallelismFactor.Init(base.mgr)
+
+	p.ChannelTaskCapFraction = ParamItem{
+		Key:          "queryCoord.channelTaskCapFraction",
+		Version:      "2.6.7",
+		DefaultValue: "0.3",
+		Doc:          "fraction of total task execution capacity reserved for channel tasks per node (0.0-1.0)",
+		Export:       true,
+	}
+	p.ChannelTaskCapFraction.Init(base.mgr)
 
 	p.BalanceCheckCollectionMaxCount = ParamItem{
 		Key:          "queryCoord.balanceCheckCollectionMaxCount",
@@ -3237,6 +3309,16 @@ Set to 0 to disable the penalty period.`,
 		Export:       false,
 	}
 	p.UpdateTargetNeedSegmentDataReady.Init(base.mgr)
+
+	p.AutoWarmupForNonPKIsolationCollection = ParamItem{
+		Key:          "queryCoord.autoWarmupForNonPKIsolationCollection",
+		Version:      "2.6.12",
+		DefaultValue: "false",
+		Doc:          `When enabled, forces vectorIndex, scalarField, and scalarIndex warmup to sync for collections without partition key isolation. vectorField is not affected.`,
+		Forbidden:    true,
+		Export:       false,
+	}
+	p.AutoWarmupForNonPKIsolationCollection.Init(base.mgr)
 }
 
 // /////////////////////////////////////////////////////////////////////////////
@@ -3315,13 +3397,6 @@ type queryNodeConfig struct {
 	FixedFileSizeForMmapManager         ParamItem `refreshable:"false"`
 	MaxMmapDiskPercentageForMmapManager ParamItem `refreshable:"false"`
 
-	LazyLoadEnabled                      ParamItem `refreshable:"false"`
-	LazyLoadWaitTimeout                  ParamItem `refreshable:"true"`
-	LazyLoadRequestResourceTimeout       ParamItem `refreshable:"true"`
-	LazyLoadRequestResourceRetryInterval ParamItem `refreshable:"true"`
-	LazyLoadMaxRetryTimes                ParamItem `refreshable:"true"`
-	LazyLoadMaxEvictPerRetry             ParamItem `refreshable:"true"`
-
 	IndexOffsetCacheEnabled ParamItem `refreshable:"true"`
 
 	ReadAheadPolicy     ParamItem `refreshable:"false"`
@@ -3354,6 +3429,7 @@ type queryNodeConfig struct {
 	IoPoolSize                  ParamItem `refreshable:"false"`
 	DeltaDataExpansionRate      ParamItem `refreshable:"true"`
 	JSONKeyStatsExpansionFactor ParamItem `refreshable:"true"`
+	TextIndexExpansionFactor    ParamItem `refreshable:"true"`
 	DiskSizeFetchInterval       ParamItem `refreshable:"false"`
 
 	// schedule task policy.
@@ -3456,9 +3532,10 @@ func (p *queryNodeConfig) init(base *BaseTable) {
 		Version:      "2.6.0",
 		DefaultValue: "sync",
 		Forbidden:    true,
-		Doc: `options: sync, disable.
+		Doc: `options: sync, async, disable.
 Specifies the timing for warming up the Tiered Storage cache.
 - "sync": data will be loaded into the cache before a segment is considered loaded.
+- "async": data will be loaded into the cache asynchronously in the background after a segment is loaded.
 - "disable": data will not be proactively loaded into the cache, and loaded only if needed by search/query tasks.
 Defaults to "sync", except for vector field which defaults to "disable".`,
 		Export: true,
@@ -4018,7 +4095,7 @@ This defaults to true, indicating that Milvus creates temporary index for growin
 	p.MmapVectorIndex = ParamItem{
 		Key:          "queryNode.mmap.vectorIndex",
 		Version:      "2.4.7",
-		DefaultValue: "true",
+		DefaultValue: "false",
 		Formatter: func(originValue string) string {
 			if p.MmapEnabled.GetAsBool() {
 				return "true"
@@ -4033,7 +4110,7 @@ This defaults to true, indicating that Milvus creates temporary index for growin
 	p.MmapScalarField = ParamItem{
 		Key:          "queryNode.mmap.scalarField",
 		Version:      "2.4.7",
-		DefaultValue: "true",
+		DefaultValue: "false",
 		Formatter: func(originValue string) string {
 			if p.MmapEnabled.GetAsBool() {
 				return "true"
@@ -4048,7 +4125,7 @@ This defaults to true, indicating that Milvus creates temporary index for growin
 	p.MmapScalarIndex = ParamItem{
 		Key:          "queryNode.mmap.scalarIndex",
 		Version:      "2.4.7",
-		DefaultValue: "true",
+		DefaultValue: "false",
 		Formatter: func(originValue string) string {
 			if p.MmapEnabled.GetAsBool() {
 				return "true"
@@ -4082,7 +4159,7 @@ This defaults to true, indicating that Milvus creates temporary index for growin
 	p.GrowingMmapEnabled = ParamItem{
 		Key:          "queryNode.mmap.growingMmapEnabled",
 		Version:      "2.4.6",
-		DefaultValue: "true",
+		DefaultValue: "false",
 		FallbackKeys: []string{"queryNode.growingMmapEnabled"},
 		Doc: `Enable memory mapping (mmap) to optimize the handling of growing raw data.
 By activating this feature, the memory overhead associated with newly added or modified data will be significantly minimized.
@@ -4108,57 +4185,6 @@ However, this optimization may come at the cost of a slight decrease in query la
 		Export:       true,
 	}
 	p.MaxMmapDiskPercentageForMmapManager.Init(base.mgr)
-
-	p.LazyLoadEnabled = ParamItem{
-		Key:          "queryNode.lazyload.enabled",
-		Version:      "2.4.2",
-		DefaultValue: "false",
-		Doc:          "Enable lazyload for loading data",
-		Export:       true,
-	}
-	p.LazyLoadEnabled.Init(base.mgr)
-	p.LazyLoadWaitTimeout = ParamItem{
-		Key:          "queryNode.lazyload.waitTimeout",
-		Version:      "2.4.2",
-		DefaultValue: "30000",
-		Doc:          "max wait timeout duration in milliseconds before start to do lazyload search and retrieve",
-		Export:       true,
-	}
-	p.LazyLoadWaitTimeout.Init(base.mgr)
-	p.LazyLoadRequestResourceTimeout = ParamItem{
-		Key:          "queryNode.lazyload.requestResourceTimeout",
-		Version:      "2.4.2",
-		DefaultValue: "5000",
-		Doc:          "max timeout in milliseconds for waiting request resource for lazy load, 5s by default",
-		Export:       true,
-	}
-	p.LazyLoadRequestResourceTimeout.Init(base.mgr)
-	p.LazyLoadRequestResourceRetryInterval = ParamItem{
-		Key:          "queryNode.lazyload.requestResourceRetryInterval",
-		Version:      "2.4.2",
-		DefaultValue: "2000",
-		Doc:          "retry interval in milliseconds for waiting request resource for lazy load, 2s by default",
-		Export:       true,
-	}
-	p.LazyLoadRequestResourceRetryInterval.Init(base.mgr)
-
-	p.LazyLoadMaxRetryTimes = ParamItem{
-		Key:          "queryNode.lazyload.maxRetryTimes",
-		Version:      "2.4.2",
-		DefaultValue: "1",
-		Doc:          "max retry times for lazy load, 1 by default",
-		Export:       true,
-	}
-	p.LazyLoadMaxRetryTimes.Init(base.mgr)
-
-	p.LazyLoadMaxEvictPerRetry = ParamItem{
-		Key:          "queryNode.lazyload.maxEvictPerRetry",
-		Version:      "2.4.2",
-		DefaultValue: "1",
-		Doc:          "max evict count for lazy load, 1 by default",
-		Export:       true,
-	}
-	p.LazyLoadMaxEvictPerRetry.Init(base.mgr)
 
 	p.ReadAheadPolicy = ParamItem{
 		Key:          "queryNode.cache.readAheadPolicy",
@@ -4406,6 +4432,14 @@ Max read concurrency must greater than or equal to 1, and less than or equal to 
 	}
 	p.JSONKeyStatsExpansionFactor.Init(base.mgr)
 
+	p.TextIndexExpansionFactor = ParamItem{
+		Key:          "querynode.textIndexExpansionFactor",
+		Version:      "2.6.8",
+		DefaultValue: "1.0",
+		Doc:          "the expansion factor for text match index memory size estimation during segment loading",
+	}
+	p.TextIndexExpansionFactor.Init(base.mgr)
+
 	p.DiskSizeFetchInterval = ParamItem{
 		Key:          "querynode.diskSizeFetchInterval",
 		Version:      "2.5.0",
@@ -4646,6 +4680,8 @@ type dataCoordConfig struct {
 	AutoUpgradeSegmentIndex        ParamItem `refreshable:"true"`
 	ForceRebuildSegmentIndex       ParamItem `refreshable:"true"`
 	TargetVecIndexVersion          ParamItem `refreshable:"true"`
+	ForceRebuildScalarSegmentIndex ParamItem `refreshable:"true"`
+	TargetScalarIndexVersion       ParamItem `refreshable:"true"`
 	SegmentFlushInterval           ParamItem `refreshable:"true"`
 	BlockingL0EntryNum             ParamItem `refreshable:"true"`
 	BlockingL0SizeInMB             ParamItem `refreshable:"true"`
@@ -4678,6 +4714,7 @@ type dataCoordConfig struct {
 	L0CompactionTriggerInterval               ParamItem `refreshable:"false"`
 	GlobalCompactionInterval                  ParamItem `refreshable:"false"`
 	CompactionExpiryTolerance                 ParamItem `refreshable:"true"`
+	BackfillCompactionTriggerInterval         ParamItem `refreshable:"true"`
 
 	SingleCompactionRatioThreshold    ParamItem `refreshable:"true"`
 	SingleCompactionDeltaLogMaxSize   ParamItem `refreshable:"true"`
@@ -4764,11 +4801,18 @@ type dataCoordConfig struct {
 	CopySegmentTaskRetention        ParamItem `refreshable:"true"`
 	CopySegmentJobTimeout           ParamItem `refreshable:"true"`
 
+	ExternalCollectionCheckInterval    ParamItem `refreshable:"true"`
+	ExternalCollectionJobTimeout       ParamItem `refreshable:"true"`
+	ExternalCollectionJobRetention     ParamItem `refreshable:"true"`
+	ExternalCollectionDropRatioWarn    ParamItem `refreshable:"true"` // warn if dropping more than this ratio of segments (0-1)
+	ExternalCollectionPreAllocSegments ParamItem `refreshable:"true"`
+
 	GracefulStopTimeout ParamItem `refreshable:"true"`
 
 	ClusteringCompactionSlotUsage ParamItem `refreshable:"true"`
 	MixCompactionSlotUsage        ParamItem `refreshable:"true"`
 	L0DeleteCompactionSlotUsage   ParamItem `refreshable:"true"`
+	BackfillCompactionSlotUsage   ParamItem `refreshable:"true"`
 	IndexTaskSlotUsage            ParamItem `refreshable:"true"`
 	ScalarIndexTaskSlotUsage      ParamItem `refreshable:"true"`
 	StatsTaskSlotUsage            ParamItem `refreshable:"true"`
@@ -5262,6 +5306,15 @@ During compaction, the size of segment # of rows is able to exceed segment max #
 	}
 	p.CompactionExpiryTolerance.Init(base.mgr)
 
+	p.BackfillCompactionTriggerInterval = ParamItem{
+		Key:          "dataCoord.compaction.backfill.triggerInterval",
+		Version:      "2.6.2",
+		Doc:          "The time interval in seconds for trigger backfill compaction",
+		DefaultValue: "20",
+		Export:       true,
+	}
+	p.BackfillCompactionTriggerInterval.Init(base.mgr)
+
 	p.MixCompactionTriggerInterval = ParamItem{
 		Key:          "dataCoord.compaction.mix.triggerInterval",
 		Version:      "2.4.15",
@@ -5705,6 +5758,28 @@ if param targetVecIndexVersion is not set, the default value is -1, which means 
 	}
 	p.TargetVecIndexVersion.Init(base.mgr)
 
+	p.ForceRebuildScalarSegmentIndex = ParamItem{
+		Key:          "dataCoord.forceRebuildScalarSegmentIndex",
+		Version:      "3.0.0",
+		DefaultValue: "false",
+		PanicIfEmpty: true,
+		Doc:          "force rebuild scalar segment index to specified scalar index engine's version",
+		Export:       true,
+	}
+	p.ForceRebuildScalarSegmentIndex.Init(base.mgr)
+
+	p.TargetScalarIndexVersion = ParamItem{
+		Key:          "dataCoord.targetScalarIndexVersion",
+		Version:      "3.0.0",
+		DefaultValue: "-1",
+		PanicIfEmpty: true,
+		Doc: `if param forceRebuildScalarSegmentIndex is enabled, the scalar index will be rebuilt to aligned with targetScalarIndexVersion.
+if param forceRebuildScalarSegmentIndex is not enabled, the newly created scalar index will be aligned with the newer one of scalar index engine's version and targetScalarIndexVersion.
+if param targetScalarIndexVersion is not set, the default value is -1, which means no target scalar index version, then the scalar index will be aligned with scalar index engine's version`,
+		Export: true,
+	}
+	p.TargetScalarIndexVersion.Init(base.mgr)
+
 	p.SegmentFlushInterval = ParamItem{
 		Key:          "dataCoord.segmentFlushInterval",
 		Version:      "2.4.6",
@@ -5874,6 +5949,51 @@ if param targetVecIndexVersion is not set, the default value is -1, which means 
 	}
 	p.CopySegmentJobTimeout.Init(base.mgr)
 
+	p.ExternalCollectionCheckInterval = ParamItem{
+		Key:          "dataCoord.externalCollectionCheckInterval",
+		Version:      "2.6.8",
+		Doc:          "The interval in seconds for external collection job checker to monitor and drive job state transitions.",
+		DefaultValue: "10",
+		PanicIfEmpty: false,
+	}
+	p.ExternalCollectionCheckInterval.Init(base.mgr)
+
+	p.ExternalCollectionJobTimeout = ParamItem{
+		Key:          "dataCoord.externalCollectionJobTimeout",
+		Version:      "2.6.8",
+		Doc:          "The timeout in seconds for external collection refresh jobs. Jobs exceeding this duration will be marked as failed.",
+		DefaultValue: "3600",
+		PanicIfEmpty: false,
+	}
+	p.ExternalCollectionJobTimeout.Init(base.mgr)
+
+	p.ExternalCollectionJobRetention = ParamItem{
+		Key:          "dataCoord.externalCollectionJobRetention",
+		Version:      "2.6.8",
+		Doc:          "The retention period in seconds for external collection jobs in Finished or Failed state before garbage collection.",
+		DefaultValue: "86400",
+		PanicIfEmpty: false,
+	}
+	p.ExternalCollectionJobRetention.Init(base.mgr)
+
+	p.ExternalCollectionDropRatioWarn = ParamItem{
+		Key:          "dataCoord.externalCollectionDropRatioWarn",
+		Version:      "2.6.8",
+		Doc:          "Warn if a refresh job would drop more than this ratio (0-1) of segments. Default 0.9 (90%).",
+		DefaultValue: "0.9",
+		PanicIfEmpty: false,
+	}
+	p.ExternalCollectionDropRatioWarn.Init(base.mgr)
+
+	p.ExternalCollectionPreAllocSegments = ParamItem{
+		Key:          "dataCoord.externalCollectionPreAllocSegments",
+		Version:      "2.6.8",
+		Doc:          "The number of segment IDs to pre-allocate for each external collection refresh task.",
+		DefaultValue: "1000",
+		PanicIfEmpty: false,
+	}
+	p.ExternalCollectionPreAllocSegments.Init(base.mgr)
+
 	p.GracefulStopTimeout = ParamItem{
 		Key:          "dataCoord.gracefulStopTimeout",
 		Version:      "2.3.7",
@@ -5926,6 +6046,23 @@ if param targetVecIndexVersion is not set, the default value is -1, which means 
 		Export:       true,
 	}
 	p.L0DeleteCompactionSlotUsage.Init(base.mgr)
+
+	p.BackfillCompactionSlotUsage = ParamItem{
+		Key:          "dataCoord.slot.backfillCompactionUsage",
+		Version:      "2.6.9",
+		Doc:          "slot usage of backfill compaction task.",
+		DefaultValue: "1",
+		PanicIfEmpty: false,
+		Export:       true,
+		Formatter: func(value string) string {
+			slot := getAsInt(value)
+			if slot < 1 {
+				return "1"
+			}
+			return strconv.Itoa(slot)
+		},
+	}
+	p.BackfillCompactionSlotUsage.Init(base.mgr)
 
 	p.IndexTaskSlotUsage = ParamItem{
 		Key:          "dataCoord.slot.indexTaskSlotUsage",
@@ -6160,6 +6297,9 @@ type dataNodeConfig struct {
 
 	WorkerSlotUnit      ParamItem `refreshable:"true"`
 	StandaloneSlotRatio ParamItem `refreshable:"false"`
+
+	// external collection
+	ExternalCollectionTargetRowsPerSegment ParamItem `refreshable:"true"`
 }
 
 func (p *dataNodeConfig) init(base *BaseTable) {
@@ -6628,6 +6768,15 @@ if this parameter <= 0, will set it as 10`,
 		Doc:          "Offline task slot ratio in standalone mode",
 	}
 	p.StandaloneSlotRatio.Init(base.mgr)
+
+	p.ExternalCollectionTargetRowsPerSegment = ParamItem{
+		Key:          "dataNode.externalCollection.targetRowsPerSegment",
+		Version:      "2.6.0",
+		DefaultValue: "1000000",
+		Doc:          "Target number of rows per segment for external collections",
+		Export:       false,
+	}
+	p.ExternalCollectionTargetRowsPerSegment.Init(base.mgr)
 }
 
 type streamingConfig struct {
@@ -6688,9 +6837,31 @@ type streamingConfig struct {
 	WALRecoveryGracefulCloseTimeout      ParamItem `refreshable:"true"`
 	WALRecoverySchemaExpirationTolerance ParamItem `refreshable:"true"`
 
-	// Empty TimeTick Filtering configration
+	// wal rate limit
+	WALRateLimitDefaultBurst                     ParamItem `refreshable:"true"`
+	WALRateLimitNodeMemorySlowdownThreshold      ParamItem `refreshable:"true"`
+	WALRateLimitNodeMemoryRejectThreshold        ParamItem `refreshable:"true"`
+	WALRateLimitNodeMemoryRecoverThreshold       ParamItem `refreshable:"true"`
+	WALRateLimitNodeMemoryAdaptiveRateLimit      AdaptiveRateLimitConfig
+	WALRateLimitFlusherAdaptiveRateLimit         AdaptiveRateLimitConfig
+	WALRateLimitRecoveryStorageAdaptiveRateLimit AdaptiveRateLimitConfig
+	WALRateLimitAppendRateEnabled                ParamItem `refreshable:"true"`
+	WALRateLimitAppendRateSlowdownThreshold      ParamItem `refreshable:"true"`
+	WALRateLimitAppendRateRecoverThreshold       ParamItem `refreshable:"true"`
+	WALRateLimitAppendRateAdaptiveRateLimit      AdaptiveRateLimitConfig
+
+	// Old version message lastConfirmedMessageID window size
+	OldVersionLastConfirmedWindowSize ParamItem `refreshable:"true"`
+
+	// Empty TimeTick Filtering configuration
 	DelegatorEmptyTimeTickMaxFilterInterval ParamItem `refreshable:"true"`
 	FlushEmptyTimeTickMaxFilterInterval     ParamItem `refreshable:"true"`
+
+	// Replication configuration
+	ReplicationUseLocalReplicaConfig ParamItem `refreshable:"true"`
+
+	// Replication filtering configuration
+	ReplicationSkipMessageTypes ParamItem `refreshable:"false"`
 }
 
 func (p *streamingConfig) init(base *BaseTable) {
@@ -6754,9 +6925,9 @@ It's ok to set it into duration string, such as 30s or 1m30s, see time.ParseDura
 	p.WALBalancerOperationTimeout = ParamItem{
 		Key:     "streaming.walBalancer.operationTimeout",
 		Version: "2.6.0",
-		Doc: `The timeout of wal balancer operation, 30s by default.
+		Doc: `The timeout of wal balancer operation, 30m by default.
 If the operation exceeds this timeout, it will be canceled.`,
-		DefaultValue: "30s",
+		DefaultValue: "30m",
 		Export:       true,
 	}
 	p.WALBalancerOperationTimeout.Init(base.mgr)
@@ -7058,6 +7229,19 @@ If the schema is older than (the channel checkpoint - tolerance), it will be rem
 	}
 	p.WALRecoverySchemaExpirationTolerance.Init(base.mgr)
 
+	p.OldVersionLastConfirmedWindowSize = ParamItem{
+		Key:     "streaming.walScanner.oldVersionLastConfirmedWindowSize",
+		Version: "2.6.13",
+		Doc: `The sliding window size for synthesizing lastConfirmedMessageID on old version (v0) WAL messages.
+Old version messages lack lastConfirmedMessageID, so the scanner synthesizes one using the message ID
+from N messages ago. This bounds the WAL replay distance when a tailing scanner falls back to catchup
+mode. A larger value means more replay on fallback but better data safety; a smaller value means faster
+recovery but slightly more risk of missing messages.`,
+		DefaultValue: "30",
+		Export:       false,
+	}
+	p.OldVersionLastConfirmedWindowSize.Init(base.mgr)
+
 	p.DelegatorEmptyTimeTickMaxFilterInterval = ParamItem{
 		Key:     "streaming.delegator.emptyTimeTick.maxFilterInterval",
 		Version: "2.6.9",
@@ -7080,15 +7264,292 @@ so we set 1 second here as a threshold.`,
 		Export:       false,
 	}
 	p.FlushEmptyTimeTickMaxFilterInterval.Init(base.mgr)
+
+	p.ReplicationUseLocalReplicaConfig = ParamItem{
+		Key:          "streaming.replication.useLocalReplicaConfig",
+		Version:      "2.6.0",
+		DefaultValue: "true",
+		Doc:          "when true, the secondary CDC cluster uses its own cluster-level replica/resource-group config instead of the primary's config for replicated AlterLoadConfig messages",
+		Export:       false,
+	}
+	p.ReplicationUseLocalReplicaConfig.Init(base.mgr)
+
+	p.ReplicationSkipMessageTypes = ParamItem{
+		Key:          "streaming.replication.skipMessageTypes",
+		Version:      "2.6.11",
+		Doc:          `Comma-separated list of message type names to skip when replicating to a secondary cluster. Messages of these types will be ignored by the secondary's replicate stream server.`,
+		DefaultValue: "AlterResourceGroup,DropResourceGroup",
+		Export:       false,
+	}
+	p.ReplicationSkipMessageTypes.Init(base.mgr)
+
+	p.WALRateLimitDefaultBurst = ParamItem{
+		Key:          "streaming.walRateLimit.defaultBurst",
+		Version:      "2.6.9",
+		Doc:          "The default burst size for the WAL rate limiter, 20MB by default. The burst size determines the maximum number of bytes that can be consumed at once.",
+		DefaultValue: "20m",
+		Export:       false,
+	}
+	p.WALRateLimitDefaultBurst.Init(base.mgr)
+
+	p.WALRateLimitNodeMemorySlowdownThreshold = ParamItem{
+		Key:          "streaming.walRateLimit.nodeMemory.slowdownThreshold",
+		Version:      "2.6.9",
+		Doc:          "When the memory usage is greater than this threshold, the node memory rate limiter will enter slowdown mode, 0.85 by default.",
+		DefaultValue: "0.85",
+		Export:       false,
+	}
+	p.WALRateLimitNodeMemorySlowdownThreshold.Init(base.mgr)
+
+	p.WALRateLimitNodeMemoryRejectThreshold = ParamItem{
+		Key:          "streaming.walRateLimit.nodeMemory.rejectThreshold",
+		Version:      "2.6.9",
+		Doc:          "When the memory usage is greater than this threshold, the node memory rate limiter will enter reject mode, 0.90 by default.",
+		DefaultValue: "0.90",
+		Export:       false,
+	}
+	p.WALRateLimitNodeMemoryRejectThreshold.Init(base.mgr)
+
+	p.WALRateLimitNodeMemoryRecoverThreshold = ParamItem{
+		Key:          "streaming.walRateLimit.nodeMemory.recoverThreshold",
+		Version:      "2.6.9",
+		Doc:          "When the memory usage is less than this threshold, the node memory rate limiter will enter recovery mode, 0.80 by default.",
+		DefaultValue: "0.80",
+		Export:       false,
+	}
+	p.WALRateLimitNodeMemoryRecoverThreshold.Init(base.mgr)
+
+	p.WALRateLimitNodeMemoryAdaptiveRateLimit.init(base, "streaming.walRateLimit.nodeMemory.adaptiveRateLimit", AdaptiveRateLimitConfigDefaultValue{
+		SlowdownStartupDelayInterval: "0",
+		SlowdownHWM:                  "4mb",
+		SlowdownLWM:                  "256kb",
+		SlowdownDecreaseInterval:     "10s",
+		SlowdownDecreaseRatio:        "0.8",
+		SlowdownRejectDelayInterval:  "0",
+		RecoveryHWM:                  "16mb",
+		RecoveryLWM:                  "1mb",
+		RecoveryNormalDelayInterval:  "10s",
+		RecoveryIncremental:          "256kb",
+		RecoveryIncreaseInterval:     "1s",
+		Export:                       false,
+	})
+
+	p.WALRateLimitRecoveryStorageAdaptiveRateLimit.init(base, "streaming.walRateLimit.recoveryStorage.adaptiveRateLimit", AdaptiveRateLimitConfigDefaultValue{
+		SlowdownStartupDelayInterval: "30s",
+		SlowdownHWM:                  "32mb",
+		SlowdownLWM:                  "512kb",
+		SlowdownDecreaseInterval:     "10s",
+		SlowdownDecreaseRatio:        "0.8",
+		SlowdownRejectDelayInterval:  "90s",
+		RecoveryHWM:                  "32mb",
+		RecoveryLWM:                  "1mb",
+		RecoveryNormalDelayInterval:  "30s",
+		RecoveryIncremental:          "1mb",
+		RecoveryIncreaseInterval:     "1s",
+		Export:                       false,
+	})
+
+	p.WALRateLimitFlusherAdaptiveRateLimit.init(base, "streaming.walRateLimit.flusher.adaptiveRateLimit", AdaptiveRateLimitConfigDefaultValue{
+		SlowdownStartupDelayInterval: "10s",
+		SlowdownHWM:                  "16mb",
+		SlowdownLWM:                  "2mb",
+		SlowdownDecreaseInterval:     "30s",
+		SlowdownDecreaseRatio:        "0.8",
+		SlowdownRejectDelayInterval:  "2m",
+		RecoveryHWM:                  "64mb",
+		RecoveryLWM:                  "16mb",
+		RecoveryNormalDelayInterval:  "5s",
+		RecoveryIncremental:          "5mb",
+		RecoveryIncreaseInterval:     "1s",
+		Export:                       false,
+	})
+
+	p.WALRateLimitAppendRateEnabled = ParamItem{
+		Key:          "streaming.walRateLimit.appendRate.enabled",
+		Version:      "2.6.10",
+		Doc:          "Whether to enable the append rate limiter, true by default. When enabled, the rate limiter will throttle writes based on append rate thresholds.",
+		DefaultValue: "false",
+		Export:       false,
+	}
+	p.WALRateLimitAppendRateEnabled.Init(base.mgr)
+
+	p.WALRateLimitAppendRateSlowdownThreshold = ParamItem{
+		Key:          "streaming.walRateLimit.appendRate.slowdownThreshold",
+		Version:      "2.6.10",
+		Doc:          "When the append rate (bytes/sec) is greater than this threshold, the append rate limiter will enter slowdown mode, 32MB/s by default. This protects each WAL from being overloaded.",
+		DefaultValue: "32m",
+		Export:       false,
+	}
+	p.WALRateLimitAppendRateSlowdownThreshold.Init(base.mgr)
+
+	p.WALRateLimitAppendRateRecoverThreshold = ParamItem{
+		Key:          "streaming.walRateLimit.appendRate.recoverThreshold",
+		Version:      "2.6.10",
+		Doc:          "When the append rate (bytes/sec) is less than this threshold, the append rate limiter will enter recovery mode, 28MB/s by default. The gap between slowdown and recover threshold prevents oscillation.",
+		DefaultValue: "28m",
+		Export:       false,
+	}
+	p.WALRateLimitAppendRateRecoverThreshold.Init(base.mgr)
+
+	p.WALRateLimitAppendRateAdaptiveRateLimit.init(base, "streaming.walRateLimit.appendRate.adaptiveRateLimit", AdaptiveRateLimitConfigDefaultValue{
+		SlowdownStartupDelayInterval: "0",
+		SlowdownHWM:                  "32mb",
+		SlowdownLWM:                  "2mb",
+		SlowdownDecreaseInterval:     "10s",
+		SlowdownDecreaseRatio:        "0.9",
+		SlowdownRejectDelayInterval:  "0",
+		RecoveryHWM:                  "32mb",
+		RecoveryLWM:                  "4mb",
+		RecoveryNormalDelayInterval:  "10s",
+		RecoveryIncremental:          "512kb",
+		RecoveryIncreaseInterval:     "1s",
+		Export:                       false,
+	})
+}
+
+type AdaptiveRateLimitConfigDefaultValue struct {
+	SlowdownStartupDelayInterval string
+	SlowdownHWM                  string
+	SlowdownLWM                  string
+	SlowdownDecreaseInterval     string
+	SlowdownDecreaseRatio        string
+	SlowdownRejectDelayInterval  string
+	RecoveryHWM                  string
+	RecoveryLWM                  string
+	RecoveryNormalDelayInterval  string
+	RecoveryIncremental          string
+	RecoveryIncreaseInterval     string
+
+	Export bool
+}
+
+type AdaptiveRateLimitConfig struct {
+	SlowdownStartupDelayInterval ParamItem `refreshable:"true"`
+	SlowdownHWM                  ParamItem `refreshable:"true"`
+	SlowdownLWM                  ParamItem `refreshable:"true"`
+	SlowdownDecreaseInterval     ParamItem `refreshable:"true"`
+	SlowdownDecreaseRatio        ParamItem `refreshable:"true"`
+	SlowdownRejectDelayInterval  ParamItem `refreshable:"true"`
+	RecoveryHWM                  ParamItem `refreshable:"true"`
+	RecoveryLWM                  ParamItem `refreshable:"true"`
+	RecoveryIncremental          ParamItem `refreshable:"true"`
+	RecoveryIncreaseInterval     ParamItem `refreshable:"true"`
+	RecoveryNormalDelayInterval  ParamItem `refreshable:"true"`
+}
+
+func (p *AdaptiveRateLimitConfig) init(
+	base *BaseTable,
+	prefix string,
+	defaults AdaptiveRateLimitConfigDefaultValue,
+) {
+	p.SlowdownStartupDelayInterval = ParamItem{
+		Key:          prefix + ".slowdown.startupDelayInterval",
+		Version:      "2.6.10",
+		Doc:          "The startup delay interval for adaptive rate limit slowdown, when the first time the rate limit enters slowdown mode, it will wait for this interval to take effect, " + defaults.SlowdownStartupDelayInterval + " by default.",
+		DefaultValue: defaults.SlowdownStartupDelayInterval,
+		Export:       defaults.Export,
+	}
+	p.SlowdownStartupDelayInterval.Init(base.mgr)
+
+	p.SlowdownHWM = ParamItem{
+		Key:          prefix + ".slowdown.hwm",
+		Version:      "2.6.10",
+		Doc:          "The high watermark of adaptive rate limit slowdown, the rate limit will be set to this value when slowdown mode is triggered, " + defaults.SlowdownHWM + "/s by default.",
+		DefaultValue: defaults.SlowdownHWM,
+		Export:       defaults.Export,
+	}
+	p.SlowdownHWM.Init(base.mgr)
+
+	p.SlowdownLWM = ParamItem{
+		Key:          prefix + ".slowdown.lwm",
+		Version:      "2.6.10",
+		Doc:          "The low watermark of adaptive rate limit slowdown, the rate limit will decrease until this value if slowdown mode is kept, " + defaults.SlowdownLWM + "/s by default.",
+		DefaultValue: defaults.SlowdownLWM,
+		Export:       defaults.Export,
+	}
+	p.SlowdownLWM.Init(base.mgr)
+
+	p.SlowdownDecreaseInterval = ParamItem{
+		Key:          prefix + ".slowdown.decreaseInterval",
+		Version:      "2.6.10",
+		Doc:          "The interval of adaptive rate limit slowdown decrease, the rate limit will decrease every this interval, " + defaults.SlowdownDecreaseInterval + " by default.",
+		DefaultValue: defaults.SlowdownDecreaseInterval,
+		Export:       defaults.Export,
+	}
+	p.SlowdownDecreaseInterval.Init(base.mgr)
+
+	p.SlowdownDecreaseRatio = ParamItem{
+		Key:          prefix + ".slowdown.decreaseRatio",
+		Version:      "2.6.10",
+		Doc:          "The ratio of adaptive rate limit slowdown decrease, the rate limit will decrease by this ratio every decrease interval, " + defaults.SlowdownDecreaseRatio + " by default.",
+		DefaultValue: defaults.SlowdownDecreaseRatio,
+		Export:       defaults.Export,
+	}
+	p.SlowdownDecreaseRatio.Init(base.mgr)
+
+	p.SlowdownRejectDelayInterval = ParamItem{
+		Key:          prefix + ".slowdown.rejectDelayInterval",
+		Version:      "2.6.10",
+		Doc:          "The delay interval of adaptive rate limit slowdown to reject mode after slowdown reaches low watermark; 0 means no reject operation will be triggered, " + defaults.SlowdownRejectDelayInterval + " by default.",
+		DefaultValue: defaults.SlowdownRejectDelayInterval,
+		Export:       defaults.Export,
+	}
+	p.SlowdownRejectDelayInterval.Init(base.mgr)
+
+	p.RecoveryHWM = ParamItem{
+		Key:          prefix + ".recovery.hwm",
+		Version:      "2.6.10",
+		Doc:          "The high watermark of adaptive rate limit recovery, the rate limit will increase until this value if recovery mode is kept, " + defaults.RecoveryHWM + "/s by default.",
+		DefaultValue: defaults.RecoveryHWM,
+		Export:       defaults.Export,
+	}
+	p.RecoveryHWM.Init(base.mgr)
+
+	p.RecoveryLWM = ParamItem{
+		Key:          prefix + ".recovery.lwm",
+		Version:      "2.6.10",
+		Doc:          "The low watermark of adaptive rate limit recovery, the rate limit will be set to this value when recovery mode is triggered, " + defaults.RecoveryLWM + "/s by default.",
+		DefaultValue: defaults.RecoveryLWM,
+		Export:       defaults.Export,
+	}
+	p.RecoveryLWM.Init(base.mgr)
+
+	p.RecoveryIncreaseInterval = ParamItem{
+		Key:          prefix + ".recovery.increaseInterval",
+		Version:      "2.6.10",
+		Doc:          "The delay interval of adaptive rate limit recovery increase, the rate limit will increase every this interval, " + defaults.RecoveryIncreaseInterval + " by default.",
+		DefaultValue: defaults.RecoveryIncreaseInterval,
+		Export:       defaults.Export,
+	}
+	p.RecoveryIncreaseInterval.Init(base.mgr)
+
+	p.RecoveryIncremental = ParamItem{
+		Key:          prefix + ".recovery.incremental",
+		Version:      "2.6.10",
+		Doc:          "The incremental of adaptive rate limit recovery, the rate limit will increase by this value every increase interval, " + defaults.RecoveryIncremental + "/s by default.",
+		DefaultValue: defaults.RecoveryIncremental,
+		Export:       defaults.Export,
+	}
+	p.RecoveryIncremental.Init(base.mgr)
+
+	p.RecoveryNormalDelayInterval = ParamItem{
+		Key:          prefix + ".recovery.normalDelayInterval",
+		Version:      "2.6.10",
+		Doc:          "The delay interval of adaptive rate limit recovery to normal mode after recovery reaches high watermark, " + defaults.RecoveryNormalDelayInterval + " by default.",
+		DefaultValue: defaults.RecoveryNormalDelayInterval,
+		Export:       defaults.Export,
+	}
+	p.RecoveryNormalDelayInterval.Init(base.mgr)
 }
 
 // runtimeConfig is just a private environment value table.
 type runtimeConfig struct {
-	createTime atomic.Time
-	updateTime atomic.Time
-	role       atomic.String
-	nodeID     atomic.Int64
-	components typeutil.ConcurrentSet[string]
+	createTime   atomic.Time
+	updateTime   atomic.Time
+	role         atomic.String
+	nodeID       atomic.Int64
+	isStandalone atomic.Bool // cached flag derived from role, avoids repeated string comparison
+	components   typeutil.ConcurrentSet[string]
 }
 
 type integrationTestConfig struct {

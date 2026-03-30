@@ -49,6 +49,7 @@
 #include "common/Consts.h"
 #include "common/EasyAssert.h"
 #include "fmt/core.h"
+#include "google/cloud/internal/rest_client.h"
 #include "google/cloud/storage/oauth2/compute_engine_credentials.h"
 #include "google/cloud/version.h"
 #include "log/Log.h"
@@ -63,6 +64,22 @@ namespace milvus::storage {
 
 std::atomic<size_t> MinioChunkManager::init_count_(0);
 std::mutex MinioChunkManager::client_mutex_;
+
+void
+ConfigureGoogleCloudIAMHttpClientFactory(Aws::SDKOptions& sdk_options) {
+    sdk_options.httpOptions.httpClientFactory_create_fn = []() {
+        auto credentials =
+            std::make_shared<google::cloud::oauth2_internal::
+                                 GOOGLE_CLOUD_CPP_NS::ComputeEngineCredentials>(
+                google::cloud::Options{},
+                [](google::cloud::Options const& opts) {
+                    return google::cloud::rest_internal::MakeDefaultRestClient(
+                        "", opts);
+                });
+        return Aws::MakeShared<GoogleHttpClientFactory>(
+            GOOGLE_CLIENT_FACTORY_ALLOCATION_TAG, credentials);
+    };
+}
 
 static void
 SwallowHandler(int signal) {
@@ -111,7 +128,8 @@ AwsLogger::ProcessFormattedStatement(Aws::String&& statement) {
 void
 MinioChunkManager::InitSDKAPI(RemoteStorageType type,
                               bool useIAM,
-                              const std::string& log_level_str) {
+                              const std::string& log_level_str,
+                              const std::string& tls_min_version) {
     std::scoped_lock lock{client_mutex_};
     const size_t initCount = init_count_++;
     if (initCount == 0) {
@@ -125,14 +143,16 @@ MinioChunkManager::InitSDKAPI(RemoteStorageType type,
         sigemptyset(&psa.sa_mask);
         sigaddset(&psa.sa_mask, SIGPIPE);
         sigaction(SIGPIPE, &psa, 0);
+        bool need_tls =
+            !tls_min_version.empty() && tls_min_version != "default";
         if (type == RemoteStorageType::GOOGLE_CLOUD && useIAM) {
-            sdk_options_.httpOptions.httpClientFactory_create_fn = []() {
-                auto credentials = std::make_shared<
-                    google::cloud::oauth2_internal::GOOGLE_CLOUD_CPP_NS::
-                        ComputeEngineCredentials>();
-                return Aws::MakeShared<GoogleHttpClientFactory>(
-                    GOOGLE_CLIENT_FACTORY_ALLOCATION_TAG, credentials);
-            };
+            ConfigureGoogleCloudIAMHttpClientFactory(sdk_options_);
+        } else if (need_tls) {
+            sdk_options_.httpOptions.httpClientFactory_create_fn =
+                [tls_min_version]() {
+                    return Aws::MakeShared<TlsHttpClientFactory>(
+                        TLS_FACTORY_ALLOCATION_TAG, tls_min_version);
+                };
         }
         LOG_INFO("init aws with log level:{}", log_level_str);
         auto get_aws_log_level = [](const std::string& level_str) {
@@ -163,7 +183,8 @@ MinioChunkManager::InitSDKAPI(RemoteStorageType type,
 }
 
 void
-MinioChunkManager::InitSDKAPIDefault(const std::string& log_level_str) {
+MinioChunkManager::InitSDKAPIDefault(const std::string& log_level_str,
+                                     const std::string& tls_min_version) {
     std::scoped_lock lock{client_mutex_};
     const size_t initCount = init_count_++;
     if (initCount == 0) {
@@ -177,6 +198,15 @@ MinioChunkManager::InitSDKAPIDefault(const std::string& log_level_str) {
         sigemptyset(&psa.sa_mask);
         sigaddset(&psa.sa_mask, SIGPIPE);
         sigaction(SIGPIPE, &psa, 0);
+        bool need_tls =
+            !tls_min_version.empty() && tls_min_version != "default";
+        if (need_tls && !sdk_options_.httpOptions.httpClientFactory_create_fn) {
+            sdk_options_.httpOptions.httpClientFactory_create_fn =
+                [tls_min_version]() {
+                    return Aws::MakeShared<TlsHttpClientFactory>(
+                        TLS_FACTORY_ALLOCATION_TAG, tls_min_version);
+                };
+        }
         LOG_INFO("init aws with log level:{}", log_level_str);
         auto get_aws_log_level = [](const std::string& level_str) {
             Aws::Utils::Logging::LogLevel level =
@@ -326,7 +356,8 @@ MinioChunkManager::BuildGoogleCloudClient(
 }
 
 MinioChunkManager::MinioChunkManager(const StorageConfig& storage_config)
-    : default_bucket_name_(storage_config.bucket_name) {
+    : default_bucket_name_(storage_config.bucket_name),
+      use_crc32c_checksum_(storage_config.use_crc32c_checksum) {
     remote_root_path_ = storage_config.root_path;
     RemoteStorageType storageType;
     if (storage_config.address.find("google") != std::string::npos) {
@@ -337,7 +368,10 @@ MinioChunkManager::MinioChunkManager(const StorageConfig& storage_config)
         storageType = RemoteStorageType::S3;
     }
 
-    InitSDKAPI(storageType, storage_config.useIAM, storage_config.log_level);
+    InitSDKAPI(storageType,
+               storage_config.useIAM,
+               storage_config.log_level,
+               storage_config.tls_min_version);
 
     // The ClientConfiguration default constructor will take a long time.
     // For more details, please refer to https://github.com/aws/aws-sdk-cpp/issues/1440
@@ -385,11 +419,15 @@ MinioChunkManager::MinioChunkManager(const StorageConfig& storage_config)
 
     LOG_INFO(
         "init MinioChunkManager with "
-        "parameter[endpoint={}][bucket_name={}][root_path={}][use_secure={}]",
+        "parameter[endpoint={}][bucket_name={}][root_path={}][use_secure={}]"
+        "[tls_min_version={}]",
         storage_config.address,
         storage_config.bucket_name,
         storage_config.root_path,
-        storage_config.useSSL);
+        storage_config.useSSL,
+        storage_config.tls_min_version.empty()
+            ? "default"
+            : storage_config.tls_min_version);
 }
 
 MinioChunkManager::~MinioChunkManager() {
@@ -598,6 +636,9 @@ MinioChunkManager::PutObjectBuffer(const std::string& bucket_name,
     Aws::S3::Model::PutObjectRequest request;
     request.SetBucket(bucket_name.c_str());
     request.SetKey(object_name.c_str());
+    if (use_crc32c_checksum_) {
+        request.SetChecksumAlgorithm(Aws::S3::Model::ChecksumAlgorithm::CRC32C);
+    }
 
     const std::shared_ptr<Aws::IOStream> input_data =
         Aws::MakeShared<Aws::StringStream>("");

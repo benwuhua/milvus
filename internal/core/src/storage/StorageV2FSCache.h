@@ -45,6 +45,8 @@ class StorageV2FSCache {
         std::string gcp_credential_json = "";
         bool use_custom_part_upload = true;
         uint32_t max_connections = 100;
+        std::string tls_min_version = "";
+        bool use_crc32c_checksum = false;
     };
 
  public:

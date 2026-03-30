@@ -219,8 +219,6 @@ func TestGetFieldWarmupPolicy(t *testing.T) {
 	})
 
 	t.Run("field TypeParams warmup propagated from collection level", func(t *testing.T) {
-		// Collection-level warmup settings are now propagated to field TypeParams by QueryCoord,
-		// so we test with warmup already in TypeParams
 		policy := getFieldWarmupPolicy(&schemapb.FieldSchema{
 			DataType: schemapb.DataType_String,
 			TypeParams: []*commonpb.KeyValuePair{
@@ -228,6 +226,16 @@ func TestGetFieldWarmupPolicy(t *testing.T) {
 			},
 		})
 		assert.Equal(t, common.WarmupDisable, policy)
+	})
+
+	t.Run("async policy in TypeParams is returned", func(t *testing.T) {
+		policy := getFieldWarmupPolicy(&schemapb.FieldSchema{
+			DataType: schemapb.DataType_String,
+			TypeParams: []*commonpb.KeyValuePair{
+				{Key: common.WarmupKey, Value: common.WarmupAsync},
+			},
+		})
+		assert.Equal(t, common.WarmupAsync, policy)
 	})
 
 	t.Run("fallback to global config for scalar field", func(t *testing.T) {
@@ -239,6 +247,15 @@ func TestGetFieldWarmupPolicy(t *testing.T) {
 		assert.Equal(t, common.WarmupSync, policy)
 	})
 
+	t.Run("fallback to global config for scalar field async", func(t *testing.T) {
+		paramtable.Get().Save(paramtable.Get().QueryNodeCfg.TieredWarmupScalarField.Key, common.WarmupAsync)
+		defer paramtable.Get().Reset(paramtable.Get().QueryNodeCfg.TieredWarmupScalarField.Key)
+		policy := getFieldWarmupPolicy(&schemapb.FieldSchema{
+			DataType: schemapb.DataType_String,
+		})
+		assert.Equal(t, common.WarmupAsync, policy)
+	})
+
 	t.Run("fallback to global config for vector field", func(t *testing.T) {
 		paramtable.Get().Save(paramtable.Get().QueryNodeCfg.TieredWarmupVectorField.Key, common.WarmupDisable)
 		defer paramtable.Get().Reset(paramtable.Get().QueryNodeCfg.TieredWarmupVectorField.Key)
@@ -246,6 +263,15 @@ func TestGetFieldWarmupPolicy(t *testing.T) {
 			DataType: schemapb.DataType_FloatVector,
 		})
 		assert.Equal(t, common.WarmupDisable, policy)
+	})
+
+	t.Run("fallback to global config for vector field async", func(t *testing.T) {
+		paramtable.Get().Save(paramtable.Get().QueryNodeCfg.TieredWarmupVectorField.Key, common.WarmupAsync)
+		defer paramtable.Get().Reset(paramtable.Get().QueryNodeCfg.TieredWarmupVectorField.Key)
+		policy := getFieldWarmupPolicy(&schemapb.FieldSchema{
+			DataType: schemapb.DataType_FloatVector,
+		})
+		assert.Equal(t, common.WarmupAsync, policy)
 	})
 }
 
@@ -265,8 +291,6 @@ func TestGetIndexWarmupPolicy(t *testing.T) {
 	})
 
 	t.Run("index params warmup propagated from collection level", func(t *testing.T) {
-		// Collection-level warmup settings are now propagated to index params by QueryCoord,
-		// so we test with warmup already in IndexParams
 		policy := getIndexWarmupPolicy(
 			&schemapb.FieldSchema{DataType: schemapb.DataType_String},
 			&querypb.FieldIndexInfo{
@@ -276,6 +300,18 @@ func TestGetIndexWarmupPolicy(t *testing.T) {
 			},
 		)
 		assert.Equal(t, common.WarmupDisable, policy)
+	})
+
+	t.Run("async policy in index params is returned", func(t *testing.T) {
+		policy := getIndexWarmupPolicy(
+			&schemapb.FieldSchema{DataType: schemapb.DataType_String},
+			&querypb.FieldIndexInfo{
+				IndexParams: []*commonpb.KeyValuePair{
+					{Key: common.WarmupKey, Value: common.WarmupAsync},
+				},
+			},
+		)
+		assert.Equal(t, common.WarmupAsync, policy)
 	})
 
 	t.Run("fallback to global config for scalar index", func(t *testing.T) {
@@ -288,6 +324,16 @@ func TestGetIndexWarmupPolicy(t *testing.T) {
 		assert.Equal(t, common.WarmupSync, policy)
 	})
 
+	t.Run("fallback to global config for scalar index async", func(t *testing.T) {
+		paramtable.Get().Save(paramtable.Get().QueryNodeCfg.TieredWarmupScalarIndex.Key, common.WarmupAsync)
+		defer paramtable.Get().Reset(paramtable.Get().QueryNodeCfg.TieredWarmupScalarIndex.Key)
+		policy := getIndexWarmupPolicy(
+			&schemapb.FieldSchema{DataType: schemapb.DataType_String},
+			&querypb.FieldIndexInfo{},
+		)
+		assert.Equal(t, common.WarmupAsync, policy)
+	})
+
 	t.Run("fallback to global config for vector index", func(t *testing.T) {
 		paramtable.Get().Save(paramtable.Get().QueryNodeCfg.TieredWarmupVectorIndex.Key, common.WarmupDisable)
 		defer paramtable.Get().Reset(paramtable.Get().QueryNodeCfg.TieredWarmupVectorIndex.Key)
@@ -296,5 +342,78 @@ func TestGetIndexWarmupPolicy(t *testing.T) {
 			&querypb.FieldIndexInfo{},
 		)
 		assert.Equal(t, common.WarmupDisable, policy)
+	})
+
+	t.Run("fallback to global config for vector index async", func(t *testing.T) {
+		paramtable.Get().Save(paramtable.Get().QueryNodeCfg.TieredWarmupVectorIndex.Key, common.WarmupAsync)
+		defer paramtable.Get().Reset(paramtable.Get().QueryNodeCfg.TieredWarmupVectorIndex.Key)
+		policy := getIndexWarmupPolicy(
+			&schemapb.FieldSchema{DataType: schemapb.DataType_FloatVector},
+			&querypb.FieldIndexInfo{},
+		)
+		assert.Equal(t, common.WarmupAsync, policy)
+	})
+}
+
+func TestGetScalarDataWarmupPolicy(t *testing.T) {
+	paramtable.Init()
+
+	t.Run("TypeParams warmup key takes priority over global config", func(t *testing.T) {
+		paramtable.Get().Save(paramtable.Get().QueryNodeCfg.TieredWarmupScalarField.Key, common.WarmupSync)
+		defer paramtable.Get().Reset(paramtable.Get().QueryNodeCfg.TieredWarmupScalarField.Key)
+		policy := getScalarDataWarmupPolicy(&schemapb.FieldSchema{
+			DataType: schemapb.DataType_String,
+			TypeParams: []*commonpb.KeyValuePair{
+				{Key: common.WarmupKey, Value: common.WarmupDisable},
+			},
+		})
+		assert.Equal(t, common.WarmupDisable, policy)
+	})
+
+	t.Run("async in TypeParams is returned", func(t *testing.T) {
+		policy := getScalarDataWarmupPolicy(&schemapb.FieldSchema{
+			DataType: schemapb.DataType_String,
+			TypeParams: []*commonpb.KeyValuePair{
+				{Key: common.WarmupKey, Value: common.WarmupAsync},
+			},
+		})
+		assert.Equal(t, common.WarmupAsync, policy)
+	})
+
+	t.Run("fallback to global scalar field config async", func(t *testing.T) {
+		paramtable.Get().Save(paramtable.Get().QueryNodeCfg.TieredWarmupScalarField.Key, common.WarmupAsync)
+		defer paramtable.Get().Reset(paramtable.Get().QueryNodeCfg.TieredWarmupScalarField.Key)
+		policy := getScalarDataWarmupPolicy(&schemapb.FieldSchema{
+			DataType: schemapb.DataType_String,
+		})
+		assert.Equal(t, common.WarmupAsync, policy)
+	})
+
+	t.Run("fallback to global scalar field config disable", func(t *testing.T) {
+		paramtable.Get().Save(paramtable.Get().QueryNodeCfg.TieredWarmupScalarField.Key, common.WarmupDisable)
+		defer paramtable.Get().Reset(paramtable.Get().QueryNodeCfg.TieredWarmupScalarField.Key)
+		policy := getScalarDataWarmupPolicy(&schemapb.FieldSchema{
+			DataType: schemapb.DataType_String,
+		})
+		assert.Equal(t, common.WarmupDisable, policy)
+	})
+
+	t.Run("field TypeParams has warmup sync", func(t *testing.T) {
+		policy := getScalarDataWarmupPolicy(&schemapb.FieldSchema{
+			DataType: schemapb.DataType_String,
+			TypeParams: []*commonpb.KeyValuePair{
+				{Key: common.WarmupKey, Value: common.WarmupSync},
+			},
+		})
+		assert.Equal(t, common.WarmupSync, policy)
+	})
+
+	t.Run("fallback to global config sync", func(t *testing.T) {
+		paramtable.Get().Save(paramtable.Get().QueryNodeCfg.TieredWarmupScalarField.Key, common.WarmupSync)
+		defer paramtable.Get().Reset(paramtable.Get().QueryNodeCfg.TieredWarmupScalarField.Key)
+		policy := getScalarDataWarmupPolicy(&schemapb.FieldSchema{
+			DataType: schemapb.DataType_String,
+		})
+		assert.Equal(t, common.WarmupSync, policy)
 	})
 }

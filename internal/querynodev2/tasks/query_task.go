@@ -2,7 +2,6 @@ package tasks
 
 import (
 	"context"
-	"fmt"
 	"strconv"
 	"time"
 
@@ -117,6 +116,7 @@ func (t *QueryTask) Execute() error {
 		t.req.Req.Base.GetMsgID(),
 		t.req.Req.GetConsistencyLevel(),
 		t.req.Req.GetCollectionTtlTimestamps(),
+		t.req.Req.GetEntityTtlPhysicalTime(),
 	)
 	if err != nil {
 		return err
@@ -129,11 +129,6 @@ func (t *QueryTask) Execute() error {
 		return err
 	}
 
-	reducer := segments.CreateSegCoreReducer(
-		t.req,
-		t.collection.Schema(),
-		t.segmentManager,
-	)
 	beforeReduce := time.Now()
 
 	reduceResults := make([]*segcorepb.RetrieveResults, 0, len(results))
@@ -142,10 +137,13 @@ func (t *QueryTask) Execute() error {
 		reduceResults = append(reduceResults, result.Result)
 		querySegments = append(querySegments, result.Segment)
 	}
-	reducedResult, err := reducer.Reduce(t.ctx, reduceResults, querySegments, retrievePlan)
+	reducedResult, err := segments.RunQNQueryPipeline(
+		t.ctx, t.req, t.collection.Schema(), t.plan,
+		reduceResults, querySegments, t.segmentManager, retrievePlan,
+	)
 
 	metrics.QueryNodeReduceLatency.WithLabelValues(
-		fmt.Sprint(paramtable.GetNodeID()),
+		paramtable.GetStringNodeID(),
 		metrics.QueryLabel,
 		metrics.ReduceSegments,
 		metrics.BatchReduce).Observe(float64(time.Since(beforeReduce).Milliseconds()))
@@ -172,6 +170,8 @@ func (t *QueryTask) Execute() error {
 		HasMoreResult:      reducedResult.HasMoreResult,
 		ScannedRemoteBytes: reducedResult.GetScannedRemoteBytes(),
 		ScannedTotalBytes:  reducedResult.GetScannedTotalBytes(),
+		ElementLevel:       reducedResult.GetElementLevel(),
+		ElementIndices:     convertSegcoreElementIndicesToInternal(reducedResult.GetElementIndices()),
 	}
 	return nil
 }
@@ -194,4 +194,18 @@ func (t *QueryTask) Result() *internalpb.RetrieveResults {
 
 func (t *QueryTask) NQ() int64 {
 	return 1
+}
+
+// convertSegcoreElementIndicesToInternal converts segcorepb.ElementIndices to internalpb.ElementIndices
+func convertSegcoreElementIndicesToInternal(src []*segcorepb.ElementIndices) []*internalpb.ElementIndices {
+	if src == nil {
+		return nil
+	}
+	dst := make([]*internalpb.ElementIndices, len(src))
+	for i, s := range src {
+		if s != nil {
+			dst[i] = &internalpb.ElementIndices{Indices: s.GetIndices()}
+		}
+	}
+	return dst
 }

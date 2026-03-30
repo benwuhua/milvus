@@ -5,6 +5,7 @@ import (
 
 	"google.golang.org/protobuf/proto"
 
+	"github.com/milvus-io/milvus-proto/go-api/v2/commonpb"
 	"github.com/milvus-io/milvus-proto/go-api/v2/milvuspb"
 	"github.com/milvus-io/milvus-proto/go-api/v2/msgpb"
 	"github.com/milvus-io/milvus/internal/metastore/model"
@@ -83,6 +84,11 @@ type RootCoordCatalog interface {
 	// List all user role pair in string for the tenant
 	// For example []string{"user1/role1"}
 	ListUserRole(ctx context.Context, tenant string) ([]string, error)
+
+	// DeleteGrantByCollectionName deletes all grants for a specific collection.
+	DeleteGrantByCollectionName(ctx context.Context, tenant string, dbName string, collectionName string) error
+	// MigrateGrantCollectionName migrates all grants from oldName to newName when a collection is renamed.
+	MigrateGrantCollectionName(ctx context.Context, tenant string, oldDBName string, oldName string, newDBName string, newName string) error
 
 	ListCredentialsWithPasswd(ctx context.Context) (map[string]string, error)
 	BackupRBAC(ctx context.Context, tenant string) (*milvuspb.RBACMeta, error)
@@ -196,7 +202,7 @@ type DataCoordCatalog interface {
 	DropIndex(ctx context.Context, collID, dropIdxID typeutil.UniqueID) error
 
 	CreateSegmentIndex(ctx context.Context, segIdx *model.SegmentIndex) error
-	ListSegmentIndexes(ctx context.Context) ([]*model.SegmentIndex, error)
+	ListSegmentIndexes(ctx context.Context, collectionID int64) ([]*model.SegmentIndex, error)
 	AlterSegmentIndexes(ctx context.Context, newSegIdxes []*model.SegmentIndex) error
 	DropSegmentIndex(ctx context.Context, collID, partID, segID, buildID typeutil.UniqueID) error
 
@@ -245,6 +251,18 @@ type DataCoordCatalog interface {
 	SaveUpdateExternalCollectionTask(ctx context.Context, task *indexpb.UpdateExternalCollectionTask) error
 	DropUpdateExternalCollectionTask(ctx context.Context, taskID typeutil.UniqueID) error
 
+	// External Collection Refresh - Separated Job/Task storage
+	ListExternalCollectionRefreshJobs(ctx context.Context) ([]*datapb.ExternalCollectionRefreshJob, error)
+	SaveExternalCollectionRefreshJob(ctx context.Context, job *datapb.ExternalCollectionRefreshJob) error
+	DropExternalCollectionRefreshJob(ctx context.Context, jobID typeutil.UniqueID) error
+	ListExternalCollectionRefreshTasks(ctx context.Context) ([]*datapb.ExternalCollectionRefreshTask, error)
+	SaveExternalCollectionRefreshTask(ctx context.Context, task *datapb.ExternalCollectionRefreshTask) error
+	DropExternalCollectionRefreshTask(ctx context.Context, taskID typeutil.UniqueID) error
+
+	// Analyzer Resource
+	SaveFileResource(ctx context.Context, resource *internalpb.FileResourceInfo, version uint64) error
+	RemoveFileResource(ctx context.Context, resourceID int64, version uint64) error
+	ListFileResource(ctx context.Context) ([]*internalpb.FileResourceInfo, uint64, error)
 	// snapshot related
 	SaveSnapshot(ctx context.Context, snapshot *datapb.SnapshotInfo) error
 	DropSnapshot(ctx context.Context, collectionID int64, snapshotID int64) error
@@ -268,6 +286,7 @@ type QueryCoordCatalog interface {
 
 	SaveCollectionTargets(ctx context.Context, target ...*querypb.CollectionTarget) error
 	RemoveCollectionTarget(ctx context.Context, collectionID int64) error
+	RemoveCollectionTargets(ctx context.Context) error
 	GetCollectionTargets(ctx context.Context) (map[int64]*querypb.CollectionTarget, error)
 }
 
@@ -339,4 +358,12 @@ type StreamingNodeCataLog interface {
 
 	// SaveConsumeCheckpoint saves the consuming checkpoint of the wal.
 	SaveConsumeCheckpoint(ctx context.Context, pChannelName string, checkpoint *streamingpb.WALCheckpoint) error
+
+	// SaveSalvageCheckpoint saves the salvage checkpoint.
+	// The checkpoint is captured during force promote.
+	SaveSalvageCheckpoint(ctx context.Context, pChannelName string, checkpoint *commonpb.ReplicateCheckpoint) error
+
+	// GetSalvageCheckpoint gets all salvage checkpoints for a channel.
+	// Returns an empty slice if none exist. One checkpoint per source cluster.
+	GetSalvageCheckpoint(ctx context.Context, pChannelName string) ([]*commonpb.ReplicateCheckpoint, error)
 }

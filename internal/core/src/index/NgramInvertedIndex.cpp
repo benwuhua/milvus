@@ -43,6 +43,8 @@
 #include "simdjson/error.h"
 #include "storage/DataCodec.h"
 #include "storage/DiskFileManagerImpl.h"
+#include "storage/IndexEntryReader.h"
+#include "storage/IndexEntryWriter.h"
 #include "storage/MemFileManagerImpl.h"
 #include "storage/ThreadPools.h"
 #include "storage/Types.h"
@@ -78,7 +80,7 @@ NgramInvertedIndex::NgramInvertedIndex(const storage::FileManagerContext& ctx,
     : min_gram_(params.min_gram), max_gram_(params.max_gram) {
     schema_ = ctx.fieldDataMeta.field_schema;
     field_id_ = ctx.fieldDataMeta.field_id;
-    mem_file_manager_ = std::make_shared<MemFileManager>(ctx);
+    file_manager_ = std::make_shared<MemFileManager>(ctx);
     disk_file_manager_ = std::make_shared<DiskFileManager>(ctx);
 
     if (params.loading_index) {
@@ -176,7 +178,7 @@ NgramInvertedIndex::BuildWithJsonFieldData(
         // handle null
         [this](int64_t offset) { this->null_offset_.push_back(offset); },
         // handle non exist
-        [this](int64_t offset) {},
+        [](int64_t offset) {},
         // handle error
         [this](const Json& json,
                const std::string& nested_path,
@@ -205,6 +207,9 @@ NgramInvertedIndex::Serialize(const Config& config) {
 
 IndexStatsPtr
 NgramInvertedIndex::Upload(const Config& config) {
+    if (kScalarIndexUseV3) {
+        return UploadV3(config);
+    }
     finish();
     auto index_build_end = std::chrono::system_clock::now();
     auto index_build_duration =
@@ -219,6 +224,29 @@ NgramInvertedIndex::Upload(const Config& config) {
         avg_row_size_);
 
     return InvertedIndexTantivy<std::string>::Upload(config);
+}
+
+void
+NgramInvertedIndex::WriteEntries(storage::IndexEntryWriter* writer) {
+    // Call parent to write tantivy index files and null_offset
+    InvertedIndexTantivy<std::string>::WriteEntries(writer);
+
+    // Write ngram-specific metadata (avg_row_size)
+    writer->WriteEntry(
+        NGRAM_AVG_ROW_SIZE_FILE_NAME, &avg_row_size_, sizeof(size_t));
+    LOG_INFO("wrote ngram avg_row_size: {} bytes", avg_row_size_);
+}
+
+void
+NgramInvertedIndex::LoadEntries(storage::IndexEntryReader& reader,
+                                const Config& config) {
+    InvertedIndexTantivy<std::string>::LoadEntries(reader, config);
+
+    auto avg_row_entry = reader.ReadEntry(NGRAM_AVG_ROW_SIZE_FILE_NAME);
+    std::memcpy(&avg_row_size_, avg_row_entry.data.data(), sizeof(size_t));
+
+    LOG_INFO("LoadEntries NgramInvertedIndex done, avg_row_size: {} bytes",
+             avg_row_size_);
 }
 
 void
@@ -239,8 +267,8 @@ NgramInvertedIndex::LoadIndexMetas(const std::vector<std::string>& index_files,
                 config, milvus::LOAD_PRIORITY)
                 .value_or(milvus::proto::common::LoadPriority::HIGH);
         // avg_row_size is only 8 bytes, never sliced
-        auto index_datas = mem_file_manager_->LoadIndexToMemory(
-            {*avg_row_size_it}, load_priority);
+        auto index_datas =
+            file_manager_->LoadIndexToMemory({*avg_row_size_it}, load_priority);
         auto avg_row_size_data =
             std::move(index_datas.at(NGRAM_AVG_ROW_SIZE_FILE_NAME));
         memcpy(
@@ -273,6 +301,10 @@ NgramInvertedIndex::RetainTantivyIndexFiles(
 void
 NgramInvertedIndex::Load(milvus::tracer::TraceContext ctx,
                          const Config& config) {
+    if (kScalarIndexUseV3) {
+        this->LoadV3(config);
+        return;
+    }
     auto index_files =
         GetValueFromConfig<std::vector<std::string>>(config, INDEX_FILES);
     AssertInfo(index_files.has_value(),
@@ -524,8 +556,6 @@ NgramInvertedIndex::ExecutePhase2(const std::string& literal,
                candidates.size(),
                batch_size);
 
-    size_t pre_count = candidates.count();
-
     TargetBitmapView res(candidates);
 
     if (schema_.data_type() == proto::schema::DataType::JSON) {
@@ -584,9 +614,8 @@ NgramInvertedIndex::ExecutePhase2(const std::string& literal,
                 break;
             }
             case proto::plan::OpType::Match: {
-                PatternMatchTranslator translator;
-                auto regex_pattern = translator(literal);
-                RegexMatcher matcher(regex_pattern);
+                // Use LikePatternMatcher optimized for LIKE patterns
+                LikePatternMatcher matcher(literal);
                 apply_predicate([&matcher, this](const milvus::Json& data) {
                     auto x =
                         data.template at<std::string_view>(this->nested_path_);
@@ -637,9 +666,8 @@ NgramInvertedIndex::ExecutePhase2(const std::string& literal,
                 break;
             }
             case proto::plan::OpType::Match: {
-                PatternMatchTranslator translator;
-                auto regex_pattern = translator(literal);
-                RegexMatcher matcher(regex_pattern);
+                // Use LikePatternMatcher optimized for LIKE patterns
+                LikePatternMatcher matcher(literal);
                 apply_predicate([&matcher](const std::string_view& data) {
                     return matcher(data);
                 });
@@ -670,7 +698,7 @@ NgramInvertedIndex::ExecuteQueryForUT(const std::string& literal,
     if (pre_filter != nullptr) {
         candidates &= *pre_filter;
         if (candidates.none()) {
-            return std::move(candidates);
+            return candidates;
         }
     }
 
@@ -678,7 +706,7 @@ NgramInvertedIndex::ExecuteQueryForUT(const std::string& literal,
     ExecutePhase1(literal, op_type, candidates);
 
     if (candidates.none()) {
-        return std::move(candidates);
+        return candidates;
     }
 
     // Phase 2: post-filter verification (full segment)

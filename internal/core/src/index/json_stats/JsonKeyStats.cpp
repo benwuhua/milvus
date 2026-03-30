@@ -137,6 +137,8 @@ JsonKeyStats::JsonKeyStats(const storage::FileManagerContext& ctx,
 }
 
 JsonKeyStats::~JsonKeyStats() {
+    bson_inverted_index_.reset();
+    bson_index_cache_slot_.reset();
     boost::filesystem::remove_all(path_);
     LOG_INFO("remove json key stats with path: {}", path_);
 }
@@ -1135,7 +1137,7 @@ JsonKeyStats::Load(milvus::tracer::TraceContext ctx, const Config& config) {
     load_priority_ = config[milvus::LOAD_PRIORITY];
     LOG_INFO("load json stats for segment {} with load priority: {}",
              segment_id_,
-             load_priority_);
+             static_cast<int>(load_priority_));
 
     auto index_files =
         GetValueFromConfig<std::vector<std::string>>(config, "index_files");
